@@ -1,0 +1,51 @@
+export namespace transfer {
+	
+	export class FileInfo {
+	    name: string;
+	    size: number;
+	    path: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new FileInfo(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.name = source["name"];
+	        this.size = source["size"];
+	        this.path = source["path"];
+	    }
+	}
+	export class PeerInfo {
+	    address: string;
+	    code: string;
+	    key: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new PeerInfo(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.address = source["address"];
+	        this.code = source["code"];
+	        this.key = source["key"];
+	    }
+	}
+	export class SendResult {
+	    code: string;
+	    key: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new SendResult(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.code = source["code"];
+	        this.key = source["key"];
+	    }
+	}
+
+}
+

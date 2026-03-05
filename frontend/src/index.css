@@ -1,0 +1,27 @@
+@import "tailwindcss";
+
+* { -webkit-user-select: none; user-select: none; }
+input, textarea { -webkit-user-select: text; user-select: text; }
+
+body {
+  font-family: 'Inter', 'Segoe UI', system-ui, -apple-system, sans-serif;
+  background: #0d0f14;
+  color: #e4e7f0;
+  height: 100vh;
+  overflow: hidden;
+  margin: 0;
+}
+
+/* Drag region for custom title bar feel */
+.drag-region { -webkit-app-region: drag; }
+.no-drag { -webkit-app-region: no-drag; }
+
+/* Custom scrollbar */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #2a2f42; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #3a3f55; }
+
+/* Smooth transitions */
+* { transition-property: color, background-color, border-color, opacity, transform;
+    transition-duration: 150ms; transition-timing-function: ease; }
