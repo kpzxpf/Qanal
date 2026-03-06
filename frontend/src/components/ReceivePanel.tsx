@@ -1,6 +1,7 @@
-import { useState, useCallback } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { EventsOn, EventsOff } from '../../wailsjs/runtime/runtime'
 import { SelectDirectory, ReceiveFile, PeerReceive } from '../../wailsjs/go/main/App'
+import { fmt, fmtDur } from '../utils/format'
 
 type Mode = 'relay' | 'p2p'
 type Phase = 'idle' | 'downloading' | 'done' | 'error'
@@ -26,16 +27,19 @@ export default function ReceivePanel({ defaultServerURL }: { defaultServerURL: s
   const [savedPath, setSavedPath] = useState('')
   const [error, setError] = useState('')
 
-  if (serverURL === 'http://localhost:8080' && defaultServerURL !== 'http://localhost:8080') {
-    setServerURL(defaultServerURL)
-  }
+  // Keep serverURL in sync with the LAN IP resolved after startup.
+  useEffect(() => {
+    if (serverURL === 'http://localhost:8080' && defaultServerURL !== 'http://localhost:8080') {
+      setServerURL(defaultServerURL)
+    }
+  }, [defaultServerURL, serverURL])
 
-  const reset = () => {
+  const reset = useCallback(() => {
     setPhase('idle')
     setProgress(null)
     setSavedPath('')
     setError('')
-  }
+  }, [])
 
   const pickDir = useCallback(async () => {
     const dir = await SelectDirectory()
@@ -281,18 +285,4 @@ export default function ReceivePanel({ defaultServerURL }: { defaultServerURL: s
       )}
     </div>
   )
-}
-
-function fmt(b: number): string {
-  if (b < 1024) return `${b} B`
-  const units = ['KB', 'MB', 'GB', 'TB']
-  let val = b / 1024, i = 0
-  while (val >= 1024 && i < units.length - 1) { val /= 1024; i++ }
-  return `${val.toFixed(1)} ${units[i]}`
-}
-
-function fmtDur(sec: number): string {
-  if (sec < 60) return `${Math.round(sec)}s`
-  if (sec < 3600) return `${Math.floor(sec / 60)}m ${Math.round(sec % 60)}s`
-  return `${Math.floor(sec / 3600)}h ${Math.floor((sec % 3600) / 60)}m`
 }

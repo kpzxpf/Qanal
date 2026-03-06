@@ -2,6 +2,7 @@ package transfer
 
 import (
 	"bufio"
+	"context"
 	"crypto/rand"
 	"encoding/base32"
 	"encoding/base64"
@@ -41,7 +42,9 @@ func StartPeer(filePath string, chunkMB int) (*PeerServer, error) {
 	}
 
 	codeSrc := make([]byte, 5)
-	rand.Read(codeSrc)
+	if _, err := rand.Read(codeSrc); err != nil {
+		return nil, fmt.Errorf("generate code: %w", err)
+	}
 	code := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(codeSrc)[:8]
 
 	ln, err := net.Listen("tcp", ":0")
@@ -65,27 +68,48 @@ func StartPeer(filePath string, chunkMB int) (*PeerServer, error) {
 	}, nil
 }
 
+// pipeChunk carries one encrypted chunk through the pipeline goroutine.
+type pipeChunk struct {
+	data     []byte
+	plainLen int64
+	err      error
+}
+
 // Serve waits for exactly one receiver connection, then streams the file directly.
+// An encryption pipeline goroutine pre-encrypts the next chunk while the current
+// one is being transmitted — overlapping CPU with network I/O.
 // Times out after 10 minutes if no receiver connects.
-func (s *PeerServer) Serve(progress ProgressFn) error {
+// Cancelling ctx interrupts the Accept() wait and any active transmission.
+func (s *PeerServer) Serve(ctx context.Context, progress ProgressFn) error {
+	// Close listener when context is cancelled so Accept() unblocks.
+	listenerDone := make(chan struct{})
+	defer close(listenerDone)
+	go func() {
+		select {
+		case <-ctx.Done():
+			s.listener.Close()
+		case <-listenerDone:
+		}
+	}()
+
 	defer s.listener.Close()
 
-	// Wait up to 10 minutes for a receiver
 	s.listener.(*net.TCPListener).SetDeadline(time.Now().Add(10 * time.Minute))
 	conn, err := s.listener.Accept()
 	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		return fmt.Errorf("waiting for receiver: %w", err)
 	}
 	defer conn.Close()
 
-	// Tune TCP for large transfers: larger buffers, no Nagle (we write big chunks)
 	if tc, ok := conn.(*net.TCPConn); ok {
 		tc.SetWriteBuffer(2 * 1024 * 1024)
-		tc.SetNoDelay(false) // batch large chunks into full segments
+		tc.SetNoDelay(false)
 	}
 
 	// ── Handshake ────────────────────────────────────────────────────────────
-	// Receiver sends 8-byte session code for authentication
 	codeBuf := make([]byte, 8)
 	if _, err := io.ReadFull(conn, codeBuf); err != nil {
 		return fmt.Errorf("read auth code: %w", err)
@@ -95,7 +119,6 @@ func (s *PeerServer) Serve(progress ProgressFn) error {
 		return fmt.Errorf("receiver sent wrong code")
 	}
 
-	// Open source file
 	f, stat, err := openFileInfo(s.filePath)
 	if err != nil {
 		conn.Write([]byte("ERR:file_error\n"))
@@ -110,7 +133,6 @@ func (s *PeerServer) Serve(progress ProgressFn) error {
 		totalChunks = 1
 	}
 
-	// Send file metadata as a JSON line
 	type metaMsg struct {
 		FileName    string `json:"f"`
 		FileSize    int64  `json:"s"`
@@ -120,35 +142,64 @@ func (s *PeerServer) Serve(progress ProgressFn) error {
 	meta, _ := json.Marshal(metaMsg{stat.Name(), fileSize, totalChunks, chunkSize})
 	conn.Write(append(meta, '\n'))
 
-	// ── Stream chunks ────────────────────────────────────────────────────────
+	// ── Encryption pipeline ──────────────────────────────────────────────────
+	// Producer encrypts next chunk while consumer transmits current one,
+	// overlapping CPU-bound encryption with network I/O.
+	pipeline := make(chan pipeChunk, 3)
+	go func() {
+		defer close(pipeline)
+		for i := 0; i < totalChunks; i++ {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			offset := int64(i) * chunkSize
+			end := min(offset+chunkSize, fileSize)
+			plain := make([]byte, end-offset)
+
+			if _, err := f.ReadAt(plain, offset); err != nil && err != io.EOF {
+				pipeline <- pipeChunk{err: fmt.Errorf("read chunk %d: %w", i, err)}
+				return
+			}
+			enc, err := encryptChunk(s.key, i, plain)
+			if err != nil {
+				pipeline <- pipeChunk{err: fmt.Errorf("encrypt chunk %d: %w", i, err)}
+				return
+			}
+			pipeline <- pipeChunk{data: enc, plainLen: end - offset}
+		}
+	}()
+
+	// ── Transmit ─────────────────────────────────────────────────────────────
 	startTime := time.Now()
 	var bytesDone int64
 	sizeBuf := make([]byte, 4)
 
-	for i := 0; i < totalChunks; i++ {
-		offset := int64(i) * chunkSize
-		end := min64(offset+chunkSize, fileSize)
-		plain := make([]byte, end-offset)
-
-		if _, err := f.ReadAt(plain, offset); err != nil && err != io.EOF {
-			return fmt.Errorf("read chunk %d: %w", i, err)
+	for i := 0; ; i++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
 		}
 
-		enc, err := encryptChunk(s.key, i, plain)
-		if err != nil {
-			return fmt.Errorf("encrypt chunk %d: %w", i, err)
+		pc, ok := <-pipeline
+		if !ok {
+			break
+		}
+		if pc.err != nil {
+			return pc.err
 		}
 
-		// Send [4-byte size][encrypted data]
-		binary.BigEndian.PutUint32(sizeBuf, uint32(len(enc)))
+		binary.BigEndian.PutUint32(sizeBuf, uint32(len(pc.data)))
 		if _, err := conn.Write(sizeBuf); err != nil {
 			return fmt.Errorf("send chunk %d size: %w", i, err)
 		}
-		if _, err := conn.Write(enc); err != nil {
+		if _, err := conn.Write(pc.data); err != nil {
 			return fmt.Errorf("send chunk %d data: %w", i, err)
 		}
 
-		bytesDone += end - offset
+		bytesDone += pc.plainLen
 		if progress != nil {
 			elapsed := time.Since(startTime).Seconds()
 			var spd int64
@@ -174,7 +225,8 @@ func (s *PeerServer) Close() {
 
 // PeerReceive connects to a PeerServer and downloads the file directly.
 // Data flows: Sender disk → encrypt → TCP → decrypt → Receiver disk (no relay hop).
-func PeerReceive(peerAddr, code, keyB64, outputDir string, progress ProgressFn) (string, error) {
+// Cancelling ctx closes the TCP connection and aborts the transfer.
+func PeerReceive(ctx context.Context, peerAddr, code, keyB64, outputDir string, progress ProgressFn) (string, error) {
 	key, err := base64.RawURLEncoding.DecodeString(keyB64)
 	if err != nil {
 		return "", fmt.Errorf("invalid key: %w", err)
@@ -183,26 +235,40 @@ func PeerReceive(peerAddr, code, keyB64, outputDir string, progress ProgressFn) 
 		return "", fmt.Errorf("key must be 32 bytes, got %d", len(key))
 	}
 
-	conn, err := net.DialTimeout("tcp", peerAddr, 30*time.Second)
+	dialer := &net.Dialer{Timeout: 30 * time.Second}
+	conn, err := dialer.DialContext(ctx, "tcp", peerAddr)
 	if err != nil {
 		return "", fmt.Errorf("connect to %s: %w", peerAddr, err)
 	}
 	defer conn.Close()
+
+	// Close connection when context is cancelled, but don't leak the goroutine
+	// when PeerReceive returns normally (connClosed is closed via defer).
+	connClosed := make(chan struct{})
+	defer close(connClosed)
+	go func() {
+		select {
+		case <-ctx.Done():
+			conn.Close()
+		case <-connClosed:
+		}
+	}()
 
 	if tc, ok := conn.(*net.TCPConn); ok {
 		tc.SetReadBuffer(2 * 1024 * 1024)
 		tc.SetNoDelay(false)
 	}
 
-	// Send 8-byte auth code
 	if _, err := fmt.Fprint(conn, code); err != nil {
 		return "", fmt.Errorf("send code: %w", err)
 	}
 
-	// Read file metadata (JSON line)
 	reader := bufio.NewReaderSize(conn, 4*1024*1024)
 	line, err := reader.ReadString('\n')
 	if err != nil {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
 		return "", fmt.Errorf("read metadata: %w", err)
 	}
 	if strings.HasPrefix(line, "ERR:") {
@@ -220,42 +286,43 @@ func PeerReceive(peerAddr, code, keyB64, outputDir string, progress ProgressFn) 
 		return "", fmt.Errorf("parse metadata: %w", err)
 	}
 
-	outPath := filepath.Join(outputDir, meta.FileName)
+	outPath := filepath.Join(outputDir, filepath.Base(meta.FileName))
 	outFile, err := os.Create(outPath)
 	if err != nil {
 		return "", fmt.Errorf("create output file: %w", err)
 	}
 	defer outFile.Close()
-	_ = outFile.Truncate(meta.FileSize) // pre-allocate to avoid fragmentation
+	_ = outFile.Truncate(meta.FileSize)
 
-	// Receive chunks sequentially, write at correct offset (preserves order)
 	startTime := time.Now()
 	var bytesDone int64
 	sizeBuf := make([]byte, 4)
 
 	for i := 0; i < meta.TotalChunks; i++ {
-		// Read 4-byte chunk size
 		if _, err := io.ReadFull(reader, sizeBuf); err != nil {
 			os.Remove(outPath)
+			if ctx.Err() != nil {
+				return "", ctx.Err()
+			}
 			return "", fmt.Errorf("read chunk %d size: %w", i, err)
 		}
 		chunkLen := binary.BigEndian.Uint32(sizeBuf)
 
-		// Read encrypted chunk
 		encData := make([]byte, chunkLen)
 		if _, err := io.ReadFull(reader, encData); err != nil {
 			os.Remove(outPath)
+			if ctx.Err() != nil {
+				return "", ctx.Err()
+			}
 			return "", fmt.Errorf("read chunk %d data: %w", i, err)
 		}
 
-		// Decrypt (+ decompress if needed)
 		plain, err := decryptChunk(key, i, encData)
 		if err != nil {
 			os.Remove(outPath)
 			return "", fmt.Errorf("chunk %d: %w", i, err)
 		}
 
-		// Write at correct file offset
 		offset := int64(i) * meta.ChunkSize
 		if _, err := outFile.WriteAt(plain, offset); err != nil {
 			os.Remove(outPath)

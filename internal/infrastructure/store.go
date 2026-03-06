@@ -5,7 +5,16 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 )
+
+// copyBufPool avoids a 4 MB allocation per chunk write.
+var copyBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 4*1024*1024)
+		return &b
+	},
+}
 
 // FileChunkStore stores encrypted chunk data as individual files.
 type FileChunkStore struct {
@@ -29,8 +38,9 @@ func (s *FileChunkStore) Write(code string, index int, r io.Reader) error {
 	}
 	defer f.Close()
 
-	buf := make([]byte, 4*1024*1024) // 4 MB copy buffer
-	_, err = io.CopyBuffer(f, r, buf)
+	bufPtr := copyBufPool.Get().(*[]byte)
+	_, err = io.CopyBuffer(f, r, *bufPtr)
+	copyBufPool.Put(bufPtr)
 	return err
 }
 
@@ -52,7 +62,7 @@ func (s *FileChunkStore) Open(code string, index int) (io.ReadCloser, int64, err
 	return f, stat.Size(), nil
 }
 
-// DeleteTransfer removes all chunk files for a transfer.
+// DeleteTransfer removes all chunk files and the transfer directory.
 func (s *FileChunkStore) DeleteTransfer(code string) error {
 	return os.RemoveAll(filepath.Join(s.baseDir, code))
 }

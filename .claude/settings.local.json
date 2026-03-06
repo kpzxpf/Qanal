@@ -1,4 +1,4 @@
-сделат{
+{
   "permissions": {
     "allow": [
       "Bash(go version:*)",

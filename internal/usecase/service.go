@@ -2,11 +2,14 @@ package usecase
 
 import (
 	"Qanal/internal/domain"
+	"context"
 	"crypto/rand"
 	"encoding/base32"
 	"fmt"
 	"io"
 	"log/slog"
+	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -22,10 +25,10 @@ type Config struct {
 }
 
 type Service struct {
-	repo    domain.TransferRepo
-	store   domain.ChunkStore
-	hub     ProgressBroadcaster
-	cfg     Config
+	repo  domain.TransferRepo
+	store domain.ChunkStore
+	hub   ProgressBroadcaster
+	cfg   Config
 }
 
 func NewService(repo domain.TransferRepo, store domain.ChunkStore, hub ProgressBroadcaster, cfg Config) *Service {
@@ -78,7 +81,12 @@ func (s *Service) Initiate(req InitiateRequest) (*InitiateResponse, error) {
 		return nil, fmt.Errorf("totalChunks must be between 1 and 100000")
 	}
 
-	code := generateCode()
+	req.FileName = sanitizeFilename(req.FileName)
+
+	code, err := generateCode()
+	if err != nil {
+		return nil, fmt.Errorf("generate code: %w", err)
+	}
 	t := &domain.Transfer{
 		Code:        code,
 		FileName:    req.FileName,
@@ -159,8 +167,9 @@ func (s *Service) CompleteTransfer(code string) error {
 	if err != nil {
 		return err
 	}
-	if t.UploadedCount() != t.TotalChunks {
-		return fmt.Errorf("not all chunks uploaded: %d/%d", t.UploadedCount(), t.TotalChunks)
+	uploaded := t.UploadedCount()
+	if uploaded != t.TotalChunks {
+		return fmt.Errorf("not all chunks uploaded: %d/%d", uploaded, t.TotalChunks)
 	}
 	return s.repo.UpdateStatus(code, domain.StatusComplete)
 }
@@ -172,30 +181,60 @@ func (s *Service) DeleteTransfer(code string) error {
 	return s.repo.Delete(code)
 }
 
-// CleanupExpired periodically removes expired transfers.
-func (s *Service) CleanupExpired(interval time.Duration) {
+// CleanupExpired periodically removes expired transfers until ctx is cancelled.
+func (s *Service) CleanupExpired(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	for range ticker.C {
-		transfers, err := s.repo.ListAll()
-		if err != nil {
-			continue
-		}
-		for _, t := range transfers {
-			if t.IsExpired() && t.Status != domain.StatusComplete {
-				slog.Info("cleaning up expired transfer", "code", t.Code)
-				_ = s.DeleteTransfer(t.Code)
+	for {
+		select {
+		case <-ticker.C:
+			transfers, err := s.repo.ListAll()
+			if err != nil {
+				continue
 			}
+			for _, t := range transfers {
+				if t.IsExpired() && t.Status != domain.StatusComplete {
+					slog.Info("cleaning up expired transfer", "code", t.Code)
+					_ = s.DeleteTransfer(t.Code)
+				}
+			}
+		case <-ctx.Done():
+			return
 		}
 	}
 }
 
 // --- Helpers ---
 
-func generateCode() string {
+func generateCode() (string, error) {
 	b := make([]byte, 5)
-	rand.Read(b)
-	return base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(b)[:8]
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generate random bytes: %w", err)
+	}
+	return base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(b)[:8], nil
+}
+
+// sanitizeFilename removes path components and characters unsafe on common
+// filesystems (Windows / Linux), preventing path traversal and injection.
+func sanitizeFilename(name string) string {
+	name = filepath.Base(name)
+	var sb strings.Builder
+	for _, r := range name {
+		switch {
+		case r < 32 || r == 127:
+			// strip control chars
+		case r == '<' || r == '>' || r == ':' || r == '"' ||
+			r == '/' || r == '\\' || r == '|' || r == '?' || r == '*':
+			sb.WriteRune('_')
+		default:
+			sb.WriteRune(r)
+		}
+	}
+	result := strings.TrimSpace(sb.String())
+	if result == "" || result == "." || result == ".." {
+		result = "file"
+	}
+	return result
 }
 
 func toInfo(t *domain.Transfer) *TransferInfo {

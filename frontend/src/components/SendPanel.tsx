@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react'
 import { EventsOn, EventsOff } from '../../wailsjs/runtime/runtime'
 import { SelectFile, GetFileInfo, SendFile, StartPeerSend, StopPeerSend } from '../../wailsjs/go/main/App'
 import type { transfer } from '../../wailsjs/go/models'
+import { fmt, fmtDur } from '../utils/format'
 
 type Mode = 'relay' | 'p2p'
 type Phase = 'idle' | 'starting' | 'waiting' | 'transferring' | 'done' | 'error'
@@ -26,7 +27,19 @@ export default function SendPanel({ defaultServerURL }: { defaultServerURL: stri
     if (serverURL === 'http://localhost:8080' && defaultServerURL !== 'http://localhost:8080') {
       setServerURL(defaultServerURL)
     }
-  }, [defaultServerURL])
+  }, [defaultServerURL, serverURL])
+
+  // Always clean up event listeners before resetting UI state to prevent leaks.
+  const reset = useCallback(() => {
+    EventsOff('transfer:progress')
+    EventsOff('transfer:error')
+    EventsOff('transfer:complete')
+    setPhase('idle')
+    setProgress(null)
+    setPeerInfo(null)
+    setRelayResult(null)
+    setError('')
+  }, [])
 
   const pickFile = useCallback(async () => {
     const path = await SelectFile()
@@ -35,15 +48,7 @@ export default function SendPanel({ defaultServerURL }: { defaultServerURL: stri
     setFilePath(path)
     setFileInfo(info)
     reset()
-  }, [])
-
-  const reset = () => {
-    setPhase('idle')
-    setProgress(null)
-    setPeerInfo(null)
-    setRelayResult(null)
-    setError('')
-  }
+  }, [reset])
 
   const startTransfer = useCallback(async () => {
     if (!fileInfo) return
@@ -86,7 +91,7 @@ export default function SendPanel({ defaultServerURL }: { defaultServerURL: stri
     EventsOff('transfer:progress'); EventsOff('transfer:error'); EventsOff('transfer:complete')
     if (mode === 'p2p') await StopPeerSend()
     reset()
-  }, [mode])
+  }, [mode, reset])
 
   const copy = (text: string, id: string) => {
     navigator.clipboard.writeText(text)
@@ -260,18 +265,4 @@ export default function SendPanel({ defaultServerURL }: { defaultServerURL: stri
       )}
     </div>
   )
-}
-
-function fmt(b: number): string {
-  if (b < 1024) return `${b} B`
-  const u = ['KB', 'MB', 'GB', 'TB']
-  let v = b / 1024, i = 0
-  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++ }
-  return `${v.toFixed(1)} ${u[i]}`
-}
-
-function fmtDur(s: number): string {
-  if (s < 60) return `${Math.round(s)}s`
-  if (s < 3600) return `${Math.floor(s / 60)}m ${Math.round(s % 60)}s`
-  return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`
 }

@@ -3,6 +3,7 @@ package transfer
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 )
@@ -10,10 +11,15 @@ import (
 // encryptChunk compresses plain (if beneficial), then encrypts with AES-256-GCM.
 //
 // Wire format: IV (12 bytes) | AES-GCM ciphertext of [flag(1) | data...]
-//   flag = flagRaw(0)  → data is original plaintext
-//   flag = flagZstd(1) → data is zstd-compressed plaintext
+//
+//	IV layout: rand(8 bytes) || BigEndian(chunkIndex, 4 bytes)
+//	flag = flagRaw(0)  → data is original plaintext
+//	flag = flagZstd(1) → data is zstd-compressed plaintext
+//
+// The random prefix guarantees IV uniqueness even if the same key were ever
+// reused. The chunk index suffix enables tamper/reorder detection in decryptChunk.
 func encryptChunk(key []byte, chunkIndex int, plain []byte) ([]byte, error) {
-	// Try compression — transparent speedup for compressible data
+	// Try compression — transparent speedup for compressible data.
 	data, isCompressed := tryCompress(plain)
 	flag := flagRaw
 	if isCompressed {
@@ -35,10 +41,14 @@ func encryptChunk(key []byte, chunkIndex int, plain []byte) ([]byte, error) {
 		return nil, err
 	}
 
-	// Deterministic IV: chunk index (4 bytes BE) + 8 zero bytes
-	// Safe because each (key, IV) pair encrypts exactly one chunk.
+	// IV = rand(8B) || BigEndian(chunkIndex, 4B)
+	// Random prefix: unique per encryption even across key reuse.
+	// Index suffix: enables chunk-order tamper detection on decryption.
 	iv := make([]byte, 12)
-	binary.BigEndian.PutUint32(iv[:4], uint32(chunkIndex))
+	if _, err := rand.Read(iv[:8]); err != nil {
+		return nil, fmt.Errorf("generate IV: %w", err)
+	}
+	binary.BigEndian.PutUint32(iv[8:], uint32(chunkIndex))
 
 	ct := gcm.Seal(nil, iv, payload, nil)
 	out := make([]byte, 12+len(ct))
@@ -63,11 +73,12 @@ func decryptChunk(key []byte, chunkIndex int, enc []byte) ([]byte, error) {
 	}
 
 	iv := enc[:12]
-	// Verify IV matches expected chunk index (tamper detection)
-	expected := make([]byte, 4)
-	binary.BigEndian.PutUint32(expected, uint32(chunkIndex))
+	// Verify the chunk-index suffix of the IV (last 4 bytes) to detect
+	// chunk reordering or tampering before AES-GCM open.
+	var expected [4]byte
+	binary.BigEndian.PutUint32(expected[:], uint32(chunkIndex))
 	for i := 0; i < 4; i++ {
-		if iv[i] != expected[i] {
+		if iv[8+i] != expected[i] {
 			return nil, fmt.Errorf("chunk %d: IV mismatch (wrong order or tampered)", chunkIndex)
 		}
 	}

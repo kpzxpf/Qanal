@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
+	"sync"
 
 	"Qanal/internal/domain"
 	"Qanal/internal/usecase"
@@ -16,19 +18,57 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  4096,
-	WriteBufferSize: 4096,
-	CheckOrigin:     func(r *http.Request) bool { return true },
+// ServicePort is the set of service operations used by the HTTP handler.
+// Depending on an interface (not *usecase.Service) keeps delivery testable
+// and decouples it from the concrete implementation.
+type ServicePort interface {
+	Initiate(usecase.InitiateRequest) (*usecase.InitiateResponse, error)
+	GetInfo(code string) (*usecase.TransferInfo, error)
+	UploadChunk(code string, index int, r io.Reader) error
+	DownloadChunk(code string, index int) (io.ReadCloser, int64, error)
+	CompleteTransfer(code string) error
+	DeleteTransfer(code string) error
 }
+
+// HubPort is the WebSocket hub interface used by the handler.
+// Using an interface instead of *Hub makes the handler testable in isolation.
+type HubPort interface {
+	Broadcast(code string, msg any)
+	ServeWS(conn *websocket.Conn, code string)
+}
+
+var (
+	upgrader = websocket.Upgrader{
+		ReadBufferSize:  4096,
+		WriteBufferSize: 4096,
+		// Only allow same-machine browser origins (Wails WebView or localhost dev).
+		CheckOrigin: func(r *http.Request) bool {
+			return isLocalOrigin(r.Header.Get("Origin"))
+		},
+	}
+
+	// downloadBufPool avoids a 4 MB allocation on every chunk download.
+	downloadBufPool = sync.Pool{
+		New: func() any {
+			b := make([]byte, 4*1024*1024)
+			return &b
+		},
+	}
+)
 
 type Handler struct {
-	svc *usecase.Service
-	hub *Hub
+	svc     ServicePort
+	hub     HubPort
+	limiter *ipLimiter
 }
 
-func NewHandler(svc *usecase.Service, hub *Hub) *Handler {
-	return &Handler{svc: svc, hub: hub}
+func NewHandler(svc ServicePort, hub HubPort) *Handler {
+	return &Handler{svc: svc, hub: hub, limiter: newIPLimiter()}
+}
+
+// Close stops the background goroutines owned by the handler (rate limiter).
+func (h *Handler) Close() {
+	h.limiter.Close()
 }
 
 func (h *Handler) Router() http.Handler {
@@ -38,7 +78,7 @@ func (h *Handler) Router() http.Handler {
 	r.Use(corsMiddleware)
 
 	r.Route("/api/v1", func(r chi.Router) {
-		r.Post("/transfers", h.createTransfer)
+		r.With(h.rateLimitMiddleware).Post("/transfers", h.createTransfer)
 		r.Get("/transfers/{code}", h.getTransfer)
 		r.Post("/transfers/{code}/complete", h.completeTransfer)
 		r.Delete("/transfers/{code}", h.deleteTransfer)
@@ -135,11 +175,17 @@ func (h *Handler) downloadChunk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer rc.Close()
+
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
 	w.Header().Set("Cache-Control", "no-store")
-	buf := make([]byte, 4*1024*1024)
-	io.CopyBuffer(w, rc, buf)
+
+	bufPtr := downloadBufPool.Get().(*[]byte)
+	if _, err := io.CopyBuffer(w, rc, *bufPtr); err != nil {
+		// Headers already sent; log for observability only.
+		slog.Warn("download chunk copy interrupted", "code", code, "index", index, "err", err)
+	}
+	downloadBufPool.Put(bufPtr)
 }
 
 func (h *Handler) completeTransfer(w http.ResponseWriter, r *http.Request) {
@@ -188,7 +234,10 @@ func jsonError(w http.ResponseWriter, msg string, status int) {
 
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		origin := r.Header.Get("Origin")
+		if isLocalOrigin(origin) && origin != "" {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+		}
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 		if r.Method == http.MethodOptions {
@@ -197,4 +246,17 @@ func corsMiddleware(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// isLocalOrigin reports whether an Origin header is from localhost.
+// Empty origin (non-browser / direct requests) is always allowed.
+func isLocalOrigin(origin string) bool {
+	if origin == "" {
+		return true
+	}
+	return strings.HasPrefix(origin, "http://localhost") ||
+		strings.HasPrefix(origin, "https://localhost") ||
+		strings.HasPrefix(origin, "http://127.0.0.1") ||
+		strings.HasPrefix(origin, "https://127.0.0.1") ||
+		strings.HasPrefix(origin, "http://[::1]")
 }
