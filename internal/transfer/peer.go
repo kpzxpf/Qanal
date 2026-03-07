@@ -19,9 +19,10 @@ import (
 
 // PeerInfo is shown to the sender so they can share it with the recipient.
 type PeerInfo struct {
-	Address string `json:"address"` // IP:PORT the receiver dials
-	Code    string `json:"code"`    // 8-char session auth token
-	Key     string `json:"key"`     // base64 AES-256 key
+	LAN  string `json:"lan"`  // local-network address: 192.168.x.x:PORT
+	WAN  string `json:"wan"`  // internet address: x.x.x.x:PORT (empty if STUN failed)
+	Code string `json:"code"` // 8-char session auth token
+	Key  string `json:"key"`  // base64url AES-256 key
 }
 
 // PeerServer is the sender-side TCP listener for direct P2P transfers.
@@ -33,7 +34,8 @@ type PeerServer struct {
 	Info     *PeerInfo
 }
 
-// StartPeer creates a TCP listener on a random port and returns credentials.
+// StartPeer creates a TCP listener on a random port, queries STUN servers to
+// discover the public WAN address, and returns credentials immediately.
 // Call Serve() in a goroutine to wait for and handle the receiver connection.
 func StartPeer(filePath string, chunkMB int) (*PeerServer, error) {
 	key := make([]byte, 32)
@@ -53,10 +55,15 @@ func StartPeer(filePath string, chunkMB int) (*PeerServer, error) {
 	}
 
 	port := ln.Addr().(*net.TCPAddr).Port
+
+	// STUN: discover external IP:port (blocks up to 3 s — acceptable at session start).
+	wanAddr, _ := DiscoverWANAddr(port) // empty on failure; not fatal
+
 	info := &PeerInfo{
-		Address: fmt.Sprintf("%s:%d", GetLocalIP(), port),
-		Code:    code,
-		Key:     base64.RawURLEncoding.EncodeToString(key),
+		LAN:  fmt.Sprintf("%s:%d", GetLocalIP(), port),
+		WAN:  wanAddr,
+		Code: code,
+		Key:  base64.RawURLEncoding.EncodeToString(key),
 	}
 
 	return &PeerServer{
@@ -81,7 +88,6 @@ type pipeChunk struct {
 // Times out after 10 minutes if no receiver connects.
 // Cancelling ctx interrupts the Accept() wait and any active transmission.
 func (s *PeerServer) Serve(ctx context.Context, progress ProgressFn) error {
-	// Close listener when context is cancelled so Accept() unblocks.
 	listenerDone := make(chan struct{})
 	defer close(listenerDone)
 	go func() {
@@ -91,7 +97,6 @@ func (s *PeerServer) Serve(ctx context.Context, progress ProgressFn) error {
 		case <-listenerDone:
 		}
 	}()
-
 	defer s.listener.Close()
 
 	s.listener.(*net.TCPListener).SetDeadline(time.Now().Add(10 * time.Minute))
@@ -105,8 +110,10 @@ func (s *PeerServer) Serve(ctx context.Context, progress ProgressFn) error {
 	defer conn.Close()
 
 	if tc, ok := conn.(*net.TCPConn); ok {
-		tc.SetWriteBuffer(2 * 1024 * 1024)
-		tc.SetNoDelay(false)
+		tc.SetWriteBuffer(8 * 1024 * 1024)
+		tc.SetNoDelay(true)
+		tc.SetKeepAlive(true)
+		tc.SetKeepAlivePeriod(30 * time.Second)
 	}
 
 	// ── Handshake ────────────────────────────────────────────────────────────
@@ -242,8 +249,6 @@ func PeerReceive(ctx context.Context, peerAddr, code, keyB64, outputDir string, 
 	}
 	defer conn.Close()
 
-	// Close connection when context is cancelled, but don't leak the goroutine
-	// when PeerReceive returns normally (connClosed is closed via defer).
 	connClosed := make(chan struct{})
 	defer close(connClosed)
 	go func() {
@@ -255,8 +260,10 @@ func PeerReceive(ctx context.Context, peerAddr, code, keyB64, outputDir string, 
 	}()
 
 	if tc, ok := conn.(*net.TCPConn); ok {
-		tc.SetReadBuffer(2 * 1024 * 1024)
-		tc.SetNoDelay(false)
+		tc.SetReadBuffer(8 * 1024 * 1024)
+		tc.SetNoDelay(true)
+		tc.SetKeepAlive(true)
+		tc.SetKeepAlivePeriod(30 * time.Second)
 	}
 
 	if _, err := fmt.Fprint(conn, code); err != nil {

@@ -31,8 +31,6 @@ type App struct {
 }
 
 // peerManager owns the lifecycle of a single active P2P sender session.
-// It is extracted from App to respect SRP: App is the Wails entry-point;
-// peerManager handles peer-session state exclusively.
 type peerManager struct {
 	mu     sync.Mutex
 	server *transfer.PeerServer
@@ -89,11 +87,9 @@ func (a *App) shutdown(ctx context.Context) {
 		defer cancel()
 		a.server.Shutdown(shutCtx)
 	}
-	// Close handler after server stops accepting requests (stops rate limiter goroutine).
 	if a.handler != nil {
 		a.handler.Close()
 	}
-	// Close repo after server shutdown — flushes pending async meta writes.
 	if a.repo != nil {
 		a.repo.Close()
 	}
@@ -140,8 +136,6 @@ func (a *App) startRelayServer() error {
 	return nil
 }
 
-// findFreePort returns the first available TCP port starting from start.
-// If no port is free within 20 attempts it returns start (will fail on listen).
 func findFreePort(start int) int {
 	for port := start; port < start+20; port++ {
 		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
@@ -213,9 +207,8 @@ func (a *App) ReceiveFile(serverURL, code, keyB64, outputDir string, workers int
 
 // ─── P2P direct transfer ──────────────────────────────────────────────────────
 
-// StartPeerSend opens a TCP listener and returns credentials immediately.
-// It then waits in the background for a receiver to connect and stream the file.
-// Progress is emitted via "transfer:progress" / "transfer:complete" / "transfer:error".
+// StartPeerSend opens a TCP listener, queries STUN for the public WAN address,
+// and returns credentials immediately. Transfer runs in a background goroutine.
 func (a *App) StartPeerSend(filePath string, chunkMB int) (*transfer.PeerInfo, error) {
 	info, ps, err := a.peers.start(filePath, chunkMB)
 	if err != nil {
@@ -226,9 +219,7 @@ func (a *App) StartPeerSend(filePath string, chunkMB int) (*transfer.PeerInfo, e
 		err := ps.Serve(a.ctx, func(e transfer.ProgressEvent) {
 			wailsruntime.EventsEmit(a.ctx, "transfer:progress", e)
 		})
-
 		a.peers.compareAndClear(ps)
-
 		if err != nil {
 			wailsruntime.EventsEmit(a.ctx, "transfer:error", map[string]string{"message": err.Error()})
 		} else {
@@ -248,7 +239,6 @@ func (a *App) StopPeerSend() {
 }
 
 // PeerReceive connects directly to a PeerServer and downloads the file.
-// No relay server involved — maximum speed.
 func (a *App) PeerReceive(peerAddr, code, keyB64, outputDir string) (string, error) {
 	outPath, err := transfer.PeerReceive(a.ctx, peerAddr, code, keyB64, outputDir, func(e transfer.ProgressEvent) {
 		wailsruntime.EventsEmit(a.ctx, "transfer:progress", e)

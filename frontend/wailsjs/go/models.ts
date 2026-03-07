@@ -17,7 +17,8 @@ export namespace transfer {
 	    }
 	}
 	export class PeerInfo {
-	    address: string;
+	    lan: string;
+	    wan: string;
 	    code: string;
 	    key: string;
 	
@@ -27,7 +28,8 @@ export namespace transfer {
 	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.address = source["address"];
+	        this.lan = source["lan"];
+	        this.wan = source["wan"];
 	        this.code = source["code"];
 	        this.key = source["key"];
 	    }

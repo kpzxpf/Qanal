@@ -33,7 +33,7 @@ func TestPeerSendReceiveRoundTrip(t *testing.T) {
 	go func() { serveErr <- ps.Serve(ctx, nil) }()
 
 	outDir := t.TempDir()
-	outPath, err := transfer.PeerReceive(ctx, ps.Info.Address, ps.Info.Code, ps.Info.Key, outDir, nil)
+	outPath, err := transfer.PeerReceive(ctx, ps.Info.LAN, ps.Info.Code, ps.Info.Key, outDir, nil)
 	if err != nil {
 		t.Fatalf("PeerReceive: %v", err)
 	}
@@ -67,7 +67,7 @@ func TestPeerSendReceiveCompressible(t *testing.T) {
 	go func() { serveErr <- ps.Serve(ctx, nil) }()
 
 	outDir := t.TempDir()
-	outPath, err := transfer.PeerReceive(ctx, ps.Info.Address, ps.Info.Code, ps.Info.Key, outDir, nil)
+	outPath, err := transfer.PeerReceive(ctx, ps.Info.LAN, ps.Info.Code, ps.Info.Key, outDir, nil)
 	if err != nil {
 		t.Fatalf("PeerReceive compressible: %v", err)
 	}
@@ -101,7 +101,7 @@ func TestPeerProgressCallback(t *testing.T) {
 	}()
 
 	outDir := t.TempDir()
-	_, err := transfer.PeerReceive(ctx, ps.Info.Address, ps.Info.Code, ps.Info.Key, outDir, func(e transfer.ProgressEvent) {
+	_, err := transfer.PeerReceive(ctx, ps.Info.LAN, ps.Info.Code, ps.Info.Key, outDir, func(e transfer.ProgressEvent) {
 		receiverEvents++
 	})
 	if err != nil {
@@ -128,7 +128,7 @@ func TestPeerWrongCode(t *testing.T) {
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- ps.Serve(ctx, nil) }()
 
-	_, err := transfer.PeerReceive(ctx, ps.Info.Address, "WRONGCOD", ps.Info.Key, t.TempDir(), nil)
+	_, err := transfer.PeerReceive(ctx, ps.Info.LAN, "WRONGCOD", ps.Info.Key, t.TempDir(), nil)
 	if err == nil {
 		t.Error("expected error for wrong auth code")
 	}
