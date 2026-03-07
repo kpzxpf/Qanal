@@ -22,6 +22,7 @@ export default function ReceivePanel({ defaultServerURL }: { defaultServerURL: s
   const [peerAddr, setPeerAddr] = useState('')
   const [keyVisible, setKeyVisible] = useState(false)
   const [outDir, setOutDir] = useState('')
+  const [workers, setWorkers] = useState(8)
   const [phase, setPhase] = useState<Phase>('idle')
   const [progress, setProgress] = useState<Progress | null>(null)
   const [savedPath, setSavedPath] = useState('')
@@ -79,7 +80,7 @@ export default function ReceivePanel({ defaultServerURL }: { defaultServerURL: s
       if (mode === 'p2p') {
         await PeerReceive(peerAddr.trim(), code.trim().toUpperCase(), key.trim(), saveDir)
       } else {
-        await ReceiveFile(serverURL, code.trim().toUpperCase(), key.trim(), saveDir, 8)
+        await ReceiveFile(serverURL, code.trim().toUpperCase(), key.trim(), saveDir, workers)
       }
     } catch (e: any) {
       setError(e?.message || String(e))
@@ -88,7 +89,7 @@ export default function ReceivePanel({ defaultServerURL }: { defaultServerURL: s
       EventsOff('transfer:error')
       EventsOff('transfer:complete')
     }
-  }, [mode, peerAddr, serverURL, code, key, outDir, canStart])
+  }, [mode, peerAddr, serverURL, code, key, outDir, workers, canStart])
 
   const pct = progress ? Math.round((progress.done / progress.total) * 100) : 0
 
@@ -162,15 +163,24 @@ export default function ReceivePanel({ defaultServerURL }: { defaultServerURL: s
           </>
         ) : (
           <>
-            <div>
-              <label className="block text-xs text-[#8b92a8] mb-1.5">Server URL</label>
-              <input
-                type="text"
-                value={serverURL}
-                onChange={e => setServerURL(e.target.value)}
-                placeholder="http://192.168.1.5:8080"
-                className="w-full bg-[#0d0f14] border border-[#2a2f42] focus:border-[#5b7cfa] rounded-lg px-3 py-2 text-sm outline-none font-mono"
-              />
+            <div className="grid grid-cols-3 gap-3">
+              <div className="col-span-2">
+                <label className="block text-xs text-[#8b92a8] mb-1.5">Server URL</label>
+                <input
+                  type="text"
+                  value={serverURL}
+                  onChange={e => setServerURL(e.target.value)}
+                  placeholder="http://192.168.1.5:8080"
+                  className="w-full bg-[#0d0f14] border border-[#2a2f42] focus:border-[#5b7cfa] rounded-lg px-3 py-2 text-sm outline-none font-mono"
+                />
+              </div>
+              <div>
+                <label className="block text-xs text-[#8b92a8] mb-1.5">Workers</label>
+                <select value={workers} onChange={e => setWorkers(Number(e.target.value))}
+                  className="w-full bg-[#0d0f14] border border-[#2a2f42] rounded-lg px-3 py-2 text-sm outline-none">
+                  <option value={4}>4</option><option value={8}>8</option><option value={16}>16</option>
+                </select>
+              </div>
             </div>
             <div className="grid grid-cols-2 gap-3">
               <div>

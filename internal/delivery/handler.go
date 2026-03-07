@@ -6,8 +6,8 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
-	"strings"
 	"sync"
 
 	"Qanal/internal/domain"
@@ -250,13 +250,15 @@ func corsMiddleware(next http.Handler) http.Handler {
 
 // isLocalOrigin reports whether an Origin header is from localhost.
 // Empty origin (non-browser / direct requests) is always allowed.
+// Uses exact hostname comparison to prevent prefix-bypass (e.g. localhost.evil.com).
 func isLocalOrigin(origin string) bool {
 	if origin == "" {
 		return true
 	}
-	return strings.HasPrefix(origin, "http://localhost") ||
-		strings.HasPrefix(origin, "https://localhost") ||
-		strings.HasPrefix(origin, "http://127.0.0.1") ||
-		strings.HasPrefix(origin, "https://127.0.0.1") ||
-		strings.HasPrefix(origin, "http://[::1]")
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	host := u.Hostname() // strips port
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
 }

@@ -20,7 +20,14 @@
       "Bash(/c/Users/vlzhn/go/bin/wails build:*)",
       "Bash(wails generate:*)",
       "Bash(~/go/bin/wails generate:*)",
-      "Bash(~/go/bin/wails build:*)"
+      "Bash(~/go/bin/wails build:*)",
+      "Bash(/c/Users/vlzhn/go/bin/go build:*)",
+      "Bash(/c/Users/vlzhn/sdk/go1.26.0/bin/go build:*)",
+      "Bash(/c/Users/vlzhn/sdk/go1.26.0/bin/go test:*)",
+      "Bash(./build/bin/Qanal.exe:*)",
+      "Read(//c/Program Files \\(x86\\)/NSIS//**)",
+      "Read(//c/Program Files/**)",
+      "Bash(powershell.exe:*)"
     ]
   }
 }

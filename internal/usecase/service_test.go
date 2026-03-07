@@ -481,7 +481,7 @@ func TestCleanupExpired(t *testing.T) {
 	}
 }
 
-func TestCleanupDoesNotRemoveCompleted(t *testing.T) {
+func TestCleanupRemovesCompletedAfterTTL(t *testing.T) {
 	repo := newMockRepo()
 	store := newMockStore()
 	hub := &mockHub{}
@@ -497,15 +497,15 @@ func TestCleanupDoesNotRemoveCompleted(t *testing.T) {
 	svc.UploadChunk(resp.Code, 0, bytes.NewReader([]byte("data")))
 	svc.CompleteTransfer(resp.Code)
 
-	time.Sleep(10 * time.Millisecond)
+	time.Sleep(10 * time.Millisecond) // let TTL expire
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go svc.CleanupExpired(ctx, time.Millisecond)
 	time.Sleep(20 * time.Millisecond)
 	cancel()
 
-	if _, ok := repo.transfers[resp.Code]; !ok {
-		t.Error("completed transfer should not be removed by cleanup")
+	if _, ok := repo.transfers[resp.Code]; ok {
+		t.Error("completed+expired transfer should be removed by cleanup")
 	}
 }
 

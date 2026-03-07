@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -26,7 +27,9 @@ func Receive(ctx context.Context, serverURL, code, keyB64, outputDir string, wor
 		return "", fmt.Errorf("key must be 32 bytes, got %d", len(keyBytes))
 	}
 
-	info, err := fetchInfo(ctx, serverURL, code)
+	client := &http.Client{Timeout: 0}
+
+	info, err := fetchInfo(ctx, client, serverURL, code)
 	if err != nil {
 		return "", err
 	}
@@ -61,8 +64,6 @@ func Receive(ctx context.Context, serverURL, code, keyB64, outputDir string, wor
 			cancel()
 		})
 	}
-
-	client := &http.Client{Timeout: 0}
 
 	for w := 0; w < workers; w++ {
 		wg.Add(1)
@@ -129,6 +130,14 @@ func Receive(ctx context.Context, serverURL, code, keyB64, outputDir string, wor
 		return "", ctx.Err()
 	}
 
+	// Best-effort cleanup: delete encrypted chunks from the relay server now that
+	// the file is safely on disk. Non-fatal — CleanupExpired will catch it later.
+	deleteCtx, deleteCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer deleteCancel()
+	if err := deleteRelayTransfer(deleteCtx, client, serverURL, code); err != nil {
+		slog.Warn("relay cleanup after download failed", "code", code, "err", err)
+	}
+
 	return outPath, nil
 }
 
@@ -141,9 +150,9 @@ type transferInfo struct {
 	ChunkSize   int64  `json:"chunkSize"`
 }
 
-func fetchInfo(ctx context.Context, serverURL, code string) (*transferInfo, error) {
+func fetchInfo(ctx context.Context, client *http.Client, serverURL, code string) (*transferInfo, error) {
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, serverURL+"/api/v1/transfers/"+code, nil)
-	r, err := http.DefaultClient.Do(req)
+	r, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("fetch transfer info: %w", err)
 	}
@@ -155,6 +164,16 @@ func fetchInfo(ctx context.Context, serverURL, code string) (*transferInfo, erro
 	var info transferInfo
 	json.NewDecoder(r.Body).Decode(&info)
 	return &info, nil
+}
+
+func deleteRelayTransfer(ctx context.Context, client *http.Client, serverURL, code string) error {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodDelete, serverURL+"/api/v1/transfers/"+code, nil)
+	r, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	r.Body.Close()
+	return nil
 }
 
 func downloadChunkWithRetry(ctx context.Context, client *http.Client, serverURL, code string, index int) ([]byte, error) {

@@ -193,8 +193,8 @@ func (s *Service) CleanupExpired(ctx context.Context, interval time.Duration) {
 				continue
 			}
 			for _, t := range transfers {
-				if t.IsExpired() && t.Status != domain.StatusComplete {
-					slog.Info("cleaning up expired transfer", "code", t.Code)
+				if t.IsExpired() {
+					slog.Info("cleaning up expired transfer", "code", t.Code, "status", t.Status)
 					_ = s.DeleteTransfer(t.Code)
 				}
 			}

@@ -7,6 +7,14 @@
   "frontend:dev:watcher": "npm run dev",
   "frontend:dev:serverUrl": "auto",
   "author": {
-    "name": "Qanal"
+    "name": "Qanal",
+    "email": ""
+  },
+  "info": {
+    "companyName": "Qanal",
+    "productName": "Qanal",
+    "productVersion": "1.0.0",
+    "copyright": "Copyright © 2026 Qanal",
+    "comments": "High-performance encrypted file transfer"
   }
 }
