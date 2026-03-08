@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"log/slog"
 	"net"
@@ -16,6 +17,7 @@ import (
 	"Qanal/internal/transfer"
 	"Qanal/internal/usecase"
 
+	qrcode "github.com/skip2/go-qrcode"
 	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
@@ -73,6 +75,12 @@ func NewApp() *App { return &App{} }
 
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
+	// Emit 'file:dropped' when user drags a file onto the window.
+	wailsruntime.OnFileDrop(ctx, func(x, y int, paths []string) {
+		if len(paths) > 0 {
+			wailsruntime.EventsEmit(ctx, "file:dropped", map[string]string{"path": paths[0]})
+		}
+	})
 	if err := a.startRelayServer(); err != nil {
 		slog.Error("relay server failed", "err", err)
 	}
@@ -249,6 +257,15 @@ func (a *App) PeerReceive(peerAddr, code, keyB64, outputDir string) (string, err
 	}
 	wailsruntime.EventsEmit(a.ctx, "transfer:complete", map[string]string{"path": outPath})
 	return outPath, nil
+}
+
+// GenerateQRCode returns a data:image/png;base64 string for the given content.
+func (a *App) GenerateQRCode(content string) (string, error) {
+	png, err := qrcode.Encode(content, qrcode.Medium, 200)
+	if err != nil {
+		return "", err
+	}
+	return "data:image/png;base64," + base64.StdEncoding.EncodeToString(png), nil
 }
 
 // FormatBytes formats bytes as human-readable string.

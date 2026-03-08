@@ -6,6 +6,10 @@ export function FormatBytes(arg1) {
   return window['go']['main']['App']['FormatBytes'](arg1);
 }
 
+export function GenerateQRCode(arg1) {
+  return window['go']['main']['App']['GenerateQRCode'](arg1);
+}
+
 export function GetFileInfo(arg1) {
   return window['go']['main']['App']['GetFileInfo'](arg1);
 }

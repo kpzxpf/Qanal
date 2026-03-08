@@ -4,6 +4,8 @@ import {transfer} from '../models';
 
 export function FormatBytes(arg1:number):Promise<string>;
 
+export function GenerateQRCode(arg1:string):Promise<string>;
+
 export function GetFileInfo(arg1:string):Promise<transfer.FileInfo>;
 
 export function GetLocalServerURL():Promise<string>;

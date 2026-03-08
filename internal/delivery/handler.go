@@ -77,6 +77,10 @@ func (h *Handler) Router() http.Handler {
 	r.Use(middleware.Recoverer)
 	r.Use(corsMiddleware)
 
+	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
+		jsonOK(w, map[string]string{"status": "ok"}, http.StatusOK)
+	})
+
 	r.Route("/api/v1", func(r chi.Router) {
 		r.With(h.rateLimitMiddleware).Post("/transfers", h.createTransfer)
 		r.Get("/transfers/{code}", h.getTransfer)

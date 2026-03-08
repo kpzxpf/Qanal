@@ -37,7 +37,18 @@ func Send(ctx context.Context, serverURL, filePath string, chunkMB, workers int,
 	}
 	keyB64 := base64.RawURLEncoding.EncodeToString(keyBytes)
 
-	client := &http.Client{Timeout: 0}
+	client := &http.Client{
+		Timeout: 0,
+		Transport: &http.Transport{
+			MaxIdleConnsPerHost:   workers * 2,
+			MaxConnsPerHost:       workers * 2,
+			DisableCompression:    true, // data is AES-encrypted (random bytes), gzip adds overhead
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: 30 * time.Second,
+			ForceAttemptHTTP2:     true,
+		},
+	}
 
 	code, err := createTransfer(ctx, client, serverURL, fileName, fileSize, totalChunks, chunkSize)
 	if err != nil {

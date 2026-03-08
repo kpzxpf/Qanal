@@ -27,7 +27,18 @@ func Receive(ctx context.Context, serverURL, code, keyB64, outputDir string, wor
 		return "", fmt.Errorf("key must be 32 bytes, got %d", len(keyBytes))
 	}
 
-	client := &http.Client{Timeout: 0}
+	client := &http.Client{
+		Timeout: 0,
+		Transport: &http.Transport{
+			MaxIdleConnsPerHost:   workers * 2,
+			MaxConnsPerHost:       workers * 2,
+			DisableCompression:    true, // data is AES-encrypted, no point re-compressing
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: 30 * time.Second,
+			ForceAttemptHTTP2:     true,
+		},
+	}
 
 	info, err := fetchInfo(ctx, client, serverURL, code)
 	if err != nil {
