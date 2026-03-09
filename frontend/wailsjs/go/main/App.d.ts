@@ -10,7 +10,7 @@ export function GetFileInfo(arg1:string):Promise<transfer.FileInfo>;
 
 export function GetLocalServerURL():Promise<string>;
 
-export function PeerReceive(arg1:string,arg2:string,arg3:string,arg4:string):Promise<string>;
+export function PeerReceive(arg1:string,arg2:string,arg3:string,arg4:string,arg5:string):Promise<string>;
 
 export function ReceiveFile(arg1:string,arg2:string,arg3:string,arg4:string,arg5:number):Promise<string>;
 

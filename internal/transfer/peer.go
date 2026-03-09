@@ -2,6 +2,7 @@ package transfer
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base32"
@@ -10,7 +11,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,10 +22,11 @@ import (
 
 // PeerInfo is shown to the sender so they can share it with the recipient.
 type PeerInfo struct {
-	LAN  string `json:"lan"`  // local-network address: 192.168.x.x:PORT
-	WAN  string `json:"wan"`  // internet address: x.x.x.x:PORT (empty if STUN failed)
-	Code string `json:"code"` // 8-char session auth token
-	Key  string `json:"key"`  // base64url AES-256 key
+	LAN   string `json:"lan"`   // local-network address: 192.168.x.x:PORT
+	WAN   string `json:"wan"`   // internet address: x.x.x.x:PORT (empty if STUN failed)
+	Code  string `json:"code"`  // 8-char session auth token
+	Key   string `json:"key"`   // base64url AES-256 key
+	Relay string `json:"relay"` // embedded relay URL for signaling + fallback
 }
 
 // PeerServer is the sender-side TCP listener for direct P2P transfers.
@@ -35,9 +39,11 @@ type PeerServer struct {
 }
 
 // StartPeer creates a TCP listener on a random port, queries STUN servers to
-// discover the public WAN address, and returns credentials immediately.
+// discover the public WAN address, registers with the relay rendezvous for
+// signaling, and returns credentials immediately.
+// relayURL is the embedded relay (e.g. http://192.168.1.5:8080).
 // Call Serve() in a goroutine to wait for and handle the receiver connection.
-func StartPeer(filePath string, chunkMB int) (*PeerServer, error) {
+func StartPeer(filePath, relayURL string, chunkMB int) (*PeerServer, error) {
 	key := make([]byte, 32)
 	if _, err := rand.Read(key); err != nil {
 		return nil, fmt.Errorf("generate key: %w", err)
@@ -60,10 +66,16 @@ func StartPeer(filePath string, chunkMB int) (*PeerServer, error) {
 	wanAddr, _ := DiscoverWANAddr(port) // empty on failure; not fatal
 
 	info := &PeerInfo{
-		LAN:  fmt.Sprintf("%s:%d", GetLocalIP(), port),
-		WAN:  wanAddr,
-		Code: code,
-		Key:  base64.RawURLEncoding.EncodeToString(key),
+		LAN:   fmt.Sprintf("%s:%d", GetLocalIP(), port),
+		WAN:   wanAddr,
+		Code:  code,
+		Key:   base64.RawURLEncoding.EncodeToString(key),
+		Relay: relayURL,
+	}
+
+	// Register with rendezvous so the receiver can find us and trigger hole punch.
+	if relayURL != "" {
+		go registerWithRendezvous(relayURL, code, wanAddr, info.LAN)
 	}
 
 	return &PeerServer{
@@ -75,6 +87,13 @@ func StartPeer(filePath string, chunkMB int) (*PeerServer, error) {
 	}, nil
 }
 
+// registerWithRendezvous POST-s sender info to the relay so the receiver can
+// find us for signaling. Fire-and-forget; errors are non-fatal.
+func registerWithRendezvous(relayURL, code, wan, lan string) {
+	body := jsonMarshal(map[string]string{"code": code, "wan": wan, "lan": lan})
+	post(relayURL+"/api/v1/p2p/register", body)
+}
+
 // pipeChunk carries one encrypted chunk through the pipeline goroutine.
 type pipeChunk struct {
 	data     []byte
@@ -82,9 +101,8 @@ type pipeChunk struct {
 	err      error
 }
 
-// Serve waits for exactly one receiver connection, then streams the file directly.
-// An encryption pipeline goroutine pre-encrypts the next chunk while the current
-// one is being transmitted — overlapping CPU with network I/O.
+// Serve waits for the receiver connection — either via direct Accept() or via
+// hole-punch outbound connect — then streams the file directly.
 // Times out after 10 minutes if no receiver connects.
 // Cancelling ctx interrupts the Accept() wait and any active transmission.
 func (s *PeerServer) Serve(ctx context.Context, progress ProgressFn) error {
@@ -100,6 +118,14 @@ func (s *PeerServer) Serve(ctx context.Context, progress ProgressFn) error {
 	defer s.listener.Close()
 
 	s.listener.(*net.TCPListener).SetDeadline(time.Now().Add(10 * time.Minute))
+
+	// If we have a relay URL, concurrently watch for receiver via rendezvous
+	// and then punch toward them. This creates a NAT mapping on our side so
+	// the receiver's inbound TCP connect can get through.
+	if s.Info.Relay != "" {
+		go s.holePunchWhenReady(ctx)
+	}
+
 	conn, err := s.listener.Accept()
 	if err != nil {
 		if ctx.Err() != nil {
@@ -228,12 +254,63 @@ func (s *PeerServer) Close() {
 	s.listener.Close()
 }
 
+// holePunchWhenReady waits for the receiver to appear in the rendezvous, then
+// fires UDP punch packets toward them so the sender's NAT entry is created.
+// The receiver's subsequent TCP connect then gets forwarded by our NAT.
+func (s *PeerServer) holePunchWhenReady(ctx context.Context) {
+	// Long-poll: relay blocks until receiver POST /p2p/meet/{code}.
+	resp, err := httpGetWithContext(ctx, s.Info.Relay+"/api/v1/p2p/wait/"+s.Info.Code, 6*time.Minute)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	var body struct {
+		ReceiverWAN string `json:"receiverWAN"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil || body.ReceiverWAN == "" {
+		return
+	}
+
+	port := s.listener.Addr().(*net.TCPAddr).Port
+	slog.Info("hole punching toward receiver", "receiverWAN", body.ReceiverWAN)
+	punchCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	UDPPunch(punchCtx, port, body.ReceiverWAN, 12*time.Second) //nolint:errcheck
+}
+
+// ── HTTP helpers ──────────────────────────────────────────────────────────────
+
+func jsonMarshal(v any) []byte {
+	b, _ := json.Marshal(v)
+	return b
+}
+
+func post(url string, body []byte) {
+	resp, err := http.Post(url, "application/json", bytes.NewReader(body)) //nolint:gosec
+	if err == nil {
+		resp.Body.Close()
+	}
+}
+
+func httpGetWithContext(ctx context.Context, url string, timeout time.Duration) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	client := &http.Client{Timeout: timeout}
+	return client.Do(req)
+}
+
 // ── Receiver side ────────────────────────────────────────────────────────────
 
-// PeerReceive connects to a PeerServer and downloads the file directly.
-// Data flows: Sender disk → encrypt → TCP → decrypt → Receiver disk (no relay hop).
-// Cancelling ctx closes the TCP connection and aborts the transfer.
-func PeerReceive(ctx context.Context, peerAddr, code, keyB64, outputDir string, progress ProgressFn) (string, error) {
+// PeerReceive connects to a PeerServer and downloads the file.
+// Connection is attempted in priority order:
+//  1. Direct TCP to peerAddr (LAN or open-port WAN)
+//  2. UDP hole punch via relay rendezvous + TCP through punched NAT
+//  3. Relay streaming fallback (if relayURL != "")
+//
+// Cancelling ctx aborts everything.
+func PeerReceive(ctx context.Context, peerAddr, code, keyB64, relayURL, outputDir string, progress ProgressFn) (string, error) {
 	key, err := base64.RawURLEncoding.DecodeString(keyB64)
 	if err != nil {
 		return "", fmt.Errorf("invalid key: %w", err)
@@ -242,20 +319,97 @@ func PeerReceive(ctx context.Context, peerAddr, code, keyB64, outputDir string, 
 		return "", fmt.Errorf("key must be 32 bytes, got %d", len(key))
 	}
 
-	dialer := &net.Dialer{Timeout: 30 * time.Second}
-	conn, err := dialer.DialContext(ctx, "tcp", peerAddr)
-	if err != nil {
-		return "", fmt.Errorf("connect to %s: %w", peerAddr, err)
+	sendCode := func(conn net.Conn) error {
+		_, err := fmt.Fprint(conn, code)
+		return err
 	}
+
+	// ── Path 1: direct TCP (LAN or open port) ───────────────────────────────
+	conn, directErr := tryDirectConnect(ctx, peerAddr)
+	if directErr == nil {
+		slog.Info("p2p: direct connection", "addr", peerAddr)
+		if err := sendCode(conn); err != nil {
+			conn.Close()
+		} else {
+			return receiveViaConn(ctx, conn, key, outputDir, progress)
+		}
+	}
+	slog.Info("p2p: direct connect failed, trying hole punch", "err", directErr)
+
+	// ── Path 2: UDP hole punch + TCP through punched NAT ────────────────────
+	if relayURL != "" && peerAddr != "" {
+		conn, punchErr := tryHolePunch(ctx, relayURL, peerAddr, code)
+		if punchErr == nil {
+			slog.Info("p2p: hole punch succeeded")
+			if err := sendCode(conn); err != nil {
+				conn.Close()
+			} else {
+				return receiveViaConn(ctx, conn, key, outputDir, progress)
+			}
+		}
+		slog.Info("p2p: hole punch failed, falling back to relay", "err", punchErr)
+	}
+
+	// ── Path 3: relay streaming fallback ────────────────────────────────────
+	if relayURL != "" {
+		slog.Info("p2p: using relay stream fallback")
+		return Receive(ctx, relayURL, code, keyB64, outputDir, 4, progress)
+	}
+
+	return "", fmt.Errorf("all connection paths failed: %w", directErr)
+}
+
+// tryDirectConnect attempts a plain TCP connection with a 5-second timeout.
+func tryDirectConnect(ctx context.Context, addr string) (net.Conn, error) {
+	d := &net.Dialer{Timeout: 5 * time.Second}
+	return d.DialContext(ctx, "tcp", addr)
+}
+
+// tryHolePunch performs UDP hole punching via the relay rendezvous, then
+// attempts a TCP connection to peerAddr through the now-open NAT mapping.
+func tryHolePunch(ctx context.Context, relayURL, peerWAN, code string) (net.Conn, error) {
+	// Discover our own WAN address via STUN (UDP).
+	ownWAN, _ := DiscoverWANAddr(0) // port 0 = ephemeral; just need the external IP
+
+	// Tell the relay we're here. The relay will notify the sender (via /wait),
+	// which will trigger the sender's UDP punch toward us.
+	meetBody := jsonMarshal(map[string]string{
+		"wan": ownWAN,
+		"lan": fmt.Sprintf("%s:0", GetLocalIP()),
+	})
+	meetResp, err := http.Post(relayURL+"/api/v1/p2p/meet/"+code, "application/json", bytes.NewReader(meetBody)) //nolint:gosec
+	if err != nil {
+		return nil, fmt.Errorf("rendezvous meet: %w", err)
+	}
+	meetResp.Body.Close()
+
+	// Punch simultaneously — sender is doing the same after /wait returns.
+	punchCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
+	defer cancel()
+	if err := UDPPunch(punchCtx, 0, peerWAN, 10*time.Second); err != nil {
+		slog.Info("p2p: udp punch no confirmation, trying TCP anyway", "err", err)
+		// Not fatal — cone NAT may have opened our side even without confirmation.
+	}
+
+	// Now attempt TCP to peerWAN — NAT entry created by punch should allow it.
+	tCtx, tCancel := context.WithTimeout(ctx, 8*time.Second)
+	defer tCancel()
+	d := &net.Dialer{Timeout: 8 * time.Second}
+	return d.DialContext(tCtx, "tcp", peerWAN)
+}
+
+// receiveViaConn performs the auth handshake and file download over an
+// already-established net.Conn (reused for both direct and hole-punch paths).
+func receiveViaConn(ctx context.Context, conn net.Conn, key []byte, outputDir string, progress ProgressFn) (string, error) {
 	defer conn.Close()
 
-	connClosed := make(chan struct{})
-	defer close(connClosed)
+	done := make(chan struct{})
+	defer close(done)
 	go func() {
 		select {
 		case <-ctx.Done():
 			conn.Close()
-		case <-connClosed:
+		case <-done:
 		}
 	}()
 
@@ -264,10 +418,6 @@ func PeerReceive(ctx context.Context, peerAddr, code, keyB64, outputDir string, 
 		tc.SetNoDelay(true)
 		tc.SetKeepAlive(true)
 		tc.SetKeepAlivePeriod(30 * time.Second)
-	}
-
-	if _, err := fmt.Fprint(conn, code); err != nil {
-		return "", fmt.Errorf("send code: %w", err)
 	}
 
 	reader := bufio.NewReaderSize(conn, 4*1024*1024)

@@ -38,7 +38,7 @@ type peerManager struct {
 	server *transfer.PeerServer
 }
 
-func (m *peerManager) start(filePath string, chunkMB int) (*transfer.PeerInfo, *transfer.PeerServer, error) {
+func (m *peerManager) start(filePath, relayURL string, chunkMB int) (*transfer.PeerInfo, *transfer.PeerServer, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -46,7 +46,7 @@ func (m *peerManager) start(filePath string, chunkMB int) (*transfer.PeerInfo, *
 		m.server.Close()
 		m.server = nil
 	}
-	ps, err := transfer.StartPeer(filePath, chunkMB)
+	ps, err := transfer.StartPeer(filePath, relayURL, chunkMB)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -216,9 +216,10 @@ func (a *App) ReceiveFile(serverURL, code, keyB64, outputDir string, workers int
 // ─── P2P direct transfer ──────────────────────────────────────────────────────
 
 // StartPeerSend opens a TCP listener, queries STUN for the public WAN address,
-// and returns credentials immediately. Transfer runs in a background goroutine.
+// registers with the embedded relay rendezvous, and returns credentials immediately.
+// Transfer runs in a background goroutine.
 func (a *App) StartPeerSend(filePath string, chunkMB int) (*transfer.PeerInfo, error) {
-	info, ps, err := a.peers.start(filePath, chunkMB)
+	info, ps, err := a.peers.start(filePath, a.GetLocalServerURL(), chunkMB)
 	if err != nil {
 		return nil, err
 	}
@@ -246,9 +247,9 @@ func (a *App) StopPeerSend() {
 	a.peers.stop()
 }
 
-// PeerReceive connects directly to a PeerServer and downloads the file.
-func (a *App) PeerReceive(peerAddr, code, keyB64, outputDir string) (string, error) {
-	outPath, err := transfer.PeerReceive(a.ctx, peerAddr, code, keyB64, outputDir, func(e transfer.ProgressEvent) {
+// PeerReceive connects to a PeerServer (direct, hole-punch, or relay fallback).
+func (a *App) PeerReceive(peerAddr, code, keyB64, relayURL, outputDir string) (string, error) {
+	outPath, err := transfer.PeerReceive(a.ctx, peerAddr, code, keyB64, relayURL, outputDir, func(e transfer.ProgressEvent) {
 		wailsruntime.EventsEmit(a.ctx, "transfer:progress", e)
 	})
 	if err != nil {

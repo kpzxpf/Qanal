@@ -1,22 +1,19 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { EventsOn, EventsOff } from '../../wailsjs/runtime/runtime'
-import { SelectDirectory, ReceiveFile, PeerReceive } from '../../wailsjs/go/main/App'
+import { EventsOn, EventsOff } from '../lib/events'
+import { SelectDirectory, PeerReceive } from '../lib/app'
 import { fmt, fmtDur } from '../utils/format'
 import { decodeLink, type ShareLink } from '../utils/sharelink'
 
-type Mode = 'relay' | 'p2p'
 type Phase = 'idle' | 'downloading' | 'done' | 'error'
 interface Progress { done: number; total: number; bytesDone: number; totalBytes: number; speedBps: number }
 
 export default function ReceivePanel({ defaultServerURL }: { defaultServerURL: string }) {
-  const [mode, setMode] = useState<Mode>('p2p')
-  const [serverURL, setServerURL] = useState(defaultServerURL)
   const [code, setCode] = useState('')
   const [key, setKey] = useState('')
-  const [peerAddr, setPeerAddr] = useState('')
+  const [peerAddr, setPeerAddr] = useState('')    // WAN addr (P2P preferred)
+  const [relayURL, setRelayURL] = useState('')    // relay for rendezvous + fallback
   const [keyVisible, setKeyVisible] = useState(false)
   const [outDir, setOutDir] = useState('')
-  const [workers, setWorkers] = useState(8)
   const [phase, setPhase] = useState<Phase>('idle')
   const [progress, setProgress] = useState<Progress | null>(null)
   const [savedPath, setSavedPath] = useState('')
@@ -25,14 +22,9 @@ export default function ReceivePanel({ defaultServerURL }: { defaultServerURL: s
   const [parsedLink, setParsedLink] = useState<ShareLink | null>(null)
   const [wanAddr, setWanAddr] = useState('')
   const [lanAddr, setLanAddr] = useState('')
+  const [showManual, setShowManual] = useState(false)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
 
-  useEffect(() => {
-    if (serverURL === 'http://localhost:8080' && defaultServerURL !== 'http://localhost:8080')
-      setServerURL(defaultServerURL)
-  }, [defaultServerURL, serverURL])
-
-  // Auto-focus textarea
   useEffect(() => { textareaRef.current?.focus() }, [])
 
   const reset = useCallback(() => {
@@ -45,20 +37,16 @@ export default function ReceivePanel({ defaultServerURL }: { defaultServerURL: s
     if (!link) return false
     setParsedLink(link)
     if (link.t === 'p') {
-      setMode('p2p')
-      setWanAddr(link.w || '')
-      setLanAddr(link.l)
+      setWanAddr(link.w || ''); setLanAddr(link.l)
+      // Default to WAN (hole punch will handle NAT); user can switch to LAN
       setPeerAddr(link.w || link.l)
-      setCode(link.c)
-      setKey(link.k)
+      setCode(link.c); setKey(link.k)
+      setRelayURL(link.r || '')
     } else {
-      setMode('relay')
-      setServerURL(link.s)
-      setCode(link.c)
-      setKey(link.k)
+      // Relay-only link: use relay streaming
+      setPeerAddr(''); setCode(link.c); setKey(link.k); setRelayURL(link.s)
     }
-    reset()
-    return true
+    reset(); return true
   }, [reset])
 
   const handleLinkChange = useCallback((s: string) => {
@@ -78,9 +66,8 @@ export default function ReceivePanel({ defaultServerURL }: { defaultServerURL: s
     if (dir) setOutDir(dir)
   }, [])
 
-  const canStart = mode === 'p2p'
-    ? peerAddr.trim() !== '' && code.trim() !== '' && key.trim() !== ''
-    : code.trim() !== '' && key.trim() !== ''
+  // Can start if we have either a peer addr OR a relay URL (plus code + key).
+  const canStart = code.trim() !== '' && key.trim() !== '' && (peerAddr.trim() !== '' || relayURL !== '')
 
   const startReceive = useCallback(async () => {
     if (!canStart) return
@@ -98,16 +85,13 @@ export default function ReceivePanel({ defaultServerURL }: { defaultServerURL: s
     })
 
     try {
-      if (mode === 'p2p') {
-        await PeerReceive(peerAddr.trim(), code.trim().toUpperCase(), key.trim(), saveDir)
-      } else {
-        await ReceiveFile(serverURL, code.trim().toUpperCase(), key.trim(), saveDir, workers)
-      }
+      // Go handles the path selection: direct → hole punch → relay fallback.
+      await PeerReceive(peerAddr.trim(), code.trim().toUpperCase(), key.trim(), relayURL, saveDir)
     } catch (e: any) {
       setError(e?.message || String(e)); setPhase('error')
       EventsOff('transfer:progress'); EventsOff('transfer:error'); EventsOff('transfer:complete')
     }
-  }, [mode, peerAddr, serverURL, code, key, outDir, workers, canStart])
+  }, [peerAddr, relayURL, code, key, outDir, canStart])
 
   const pct = progress ? Math.round((progress.done / progress.total) * 100) : 0
 
@@ -116,42 +100,39 @@ export default function ReceivePanel({ defaultServerURL }: { defaultServerURL: s
     const remaining = progress ? progress.totalBytes - progress.bytesDone : 0
     const eta = progress && progress.speedBps > 0 && remaining > 0 ? remaining / progress.speedBps : 0
     return (
-      <div className="max-w-2xl space-y-3">
-        <div className="bg-[#161920] border border-[#2a2f42] rounded-2xl p-6 space-y-4">
-          <div className="flex items-center gap-2">
-            <span className="w-2 h-2 rounded-full bg-[#5b7cfa] animate-pulse" />
-            <span className="text-[#8b92a8] text-sm">
-              {mode === 'p2p' ? 'Получение файла…' : 'Загрузка с сервера…'}
-            </span>
-          </div>
+      <div className="space-y-3">
+        <div className="flex items-center gap-2.5 px-1">
+          <span className="w-2 h-2 rounded-full bg-[#5b7cfa] animate-pulse shrink-0" />
+          <span className="text-sm font-medium text-[#8b92a8]">
+            Получение файла…
+          </span>
+          {progress && <span className="ml-auto font-bold text-sm text-[#5b7cfa]">{pct}%</span>}
+        </div>
+
+        <div className="bg-[#0f1117] border border-[#1e2235] rounded-xl p-4 space-y-3">
           {progress ? (
             <>
-              <div className="flex justify-between items-end">
-                <span className="text-[#8b92a8] text-xs">{progress.done}/{progress.total} чанков</span>
-                <span className="font-bold text-lg">{pct}%</span>
-              </div>
-              <div className="h-2.5 bg-[#0d0f14] rounded-full overflow-hidden">
+              <div className="h-1.5 bg-[#1e2235] rounded-full overflow-hidden">
                 <div className="h-full bg-gradient-to-r from-[#5b7cfa] to-[#a78bfa] rounded-full transition-all duration-300"
                   style={{ width: `${pct}%` }} />
               </div>
-              <div className="flex items-center justify-between text-xs">
-                <span className="text-[#8b92a8]">{fmt(progress.bytesDone)} / {fmt(progress.totalBytes)}</span>
+              <div className="flex items-center justify-between text-xs text-[#4a5068]">
+                <span>{fmt(progress.bytesDone)} / {fmt(progress.totalBytes)}</span>
                 <div className="flex items-center gap-3">
-                  {progress.speedBps > 0 && (
-                    <span className="text-[#34d399] font-bold text-sm">{fmt(progress.speedBps)}/с</span>
-                  )}
-                  {eta > 0 && <span className="text-[#8b92a8]">ETA {fmtDur(eta)}</span>}
+                  {progress.speedBps > 0 && <span className="text-[#34d399] font-bold">{fmt(progress.speedBps)}/с</span>}
+                  {eta > 0 && <span>ETA {fmtDur(eta)}</span>}
                 </div>
               </div>
             </>
           ) : (
-            <div className="flex justify-center py-4">
-              <div className="w-8 h-8 border-2 border-[#5b7cfa]/30 border-t-[#5b7cfa] rounded-full animate-spin" />
+            <div className="flex justify-center py-6">
+              <div className="w-8 h-8 border-2 border-[#5b7cfa]/20 border-t-[#5b7cfa] rounded-full animate-spin" />
             </div>
           )}
         </div>
+
         <button onClick={reset}
-          className="w-full py-2.5 rounded-xl text-sm text-[#8b92a8] border border-[#2a2f42] hover:border-red-500/40 hover:text-red-400 transition-all">
+          className="w-full py-2.5 rounded-xl text-xs text-[#4a5068] border border-[#1e2235] hover:border-red-500/30 hover:text-red-400 transition-all">
           Отменить
         </button>
       </div>
@@ -161,164 +142,139 @@ export default function ReceivePanel({ defaultServerURL }: { defaultServerURL: s
   // ── Done ────────────────────────────────────────────────────────────────────
   if (phase === 'done') {
     return (
-      <div className="max-w-2xl space-y-3">
-        <div className="bg-[#161920] border border-[#34d399]/30 rounded-2xl p-6 text-center space-y-3">
-          <div className="text-3xl">✅</div>
-          <div className="font-bold text-[#34d399] text-lg">Файл получен</div>
+      <div className="space-y-3">
+        <div className="bg-[#0f1117] border border-[#34d399]/20 rounded-xl p-5 text-center space-y-1.5">
+          <div className="text-2xl mb-2">✅</div>
+          <div className="font-bold text-[#34d399]">Файл получен</div>
           {savedPath && (
-            <div className="font-mono text-xs text-[#8b92a8] break-all bg-[#0d0f14] rounded-lg px-3 py-2 text-left">
+            <div className="font-mono text-xs text-[#4a5068] break-all bg-[#0a0c10] rounded-lg px-3 py-2 mt-2 text-left border border-[#1e2235]">
               {savedPath}
             </div>
           )}
           {progress && (
-            <div className="text-sm text-[#8b92a8]">
+            <div className="text-xs text-[#4a5068] mt-1">
               {fmt(progress.totalBytes)}
               {progress.speedBps > 0 && <span className="ml-2 text-[#34d399] font-semibold">{fmt(progress.speedBps)}/с</span>}
             </div>
           )}
         </div>
         <button onClick={reset}
-          className="w-full py-3 rounded-xl font-semibold text-sm bg-[#1e2230] text-[#8b92a8] hover:text-[#e4e7f0] border border-[#2a2f42] hover:border-[#5b7cfa] transition-all">
+          className="w-full py-3 rounded-xl text-sm font-semibold text-[#4a5068] border border-[#1e2235] hover:border-[#5b7cfa]/40 hover:text-[#8b92a8] transition-all">
           Принять ещё
         </button>
       </div>
     )
   }
 
-  // ── Idle / error ────────────────────────────────────────────────────────────
+  // ── Idle / error ─────────────────────────────────────────────────────────────
   return (
-    <div className="space-y-3 max-w-2xl">
-
+    <div className="space-y-3">
       {/* Paste link */}
-      <div className={`bg-[#161920] rounded-xl p-5 border transition-all ${
-        parsedLink ? 'border-[#34d399]/40' : 'border-[#5b7cfa]/40'
-      }`}>
-        <div className="text-xs font-semibold uppercase tracking-widest mb-2 text-[#8b92a8]">
-          Строка подключения от отправителя
+      <div className={`bg-[#0f1117] rounded-xl border transition-all ${parsedLink ? 'border-[#34d399]/25' : 'border-[#1e2235]'}`}>
+        <div className="px-4 pt-3 pb-1">
+          <p className="text-xs text-[#4a5068] uppercase tracking-widest font-semibold mb-2">Строка от отправителя</p>
         </div>
+
         {!parsedLink ? (
-          <>
+          <div className="px-4 pb-3">
             <textarea
               ref={textareaRef}
               rows={2}
               value={linkStr}
               onChange={e => handleLinkChange(e.target.value)}
-              onPaste={e => {
-                const text = e.clipboardData.getData('text')
-                setTimeout(() => handleLinkChange(text), 0)
-              }}
-              placeholder="Вставьте строку QNL:... — поля заполнятся автоматически"
-              className="w-full bg-[#0d0f14] border border-[#2a2f42] focus:border-[#5b7cfa] rounded-lg px-3 py-2.5 text-xs outline-none font-mono resize-none text-[#8b92a8] placeholder:text-[#4a5068]"
+              onPaste={e => { const text = e.clipboardData.getData('text'); setTimeout(() => handleLinkChange(text), 0) }}
+              placeholder="Вставьте строку QNL:… — поля заполнятся сами"
+              className="w-full bg-[#0a0c10] border border-[#1e2235] focus:border-[#5b7cfa] rounded-lg px-3 py-2.5 text-xs outline-none font-mono resize-none text-[#8b92a8] placeholder:text-[#2a3050]"
             />
-            <p className="text-xs text-[#4a5068] mt-1.5">Или заполните поля вручную ниже</p>
-          </>
+          </div>
         ) : (
-          <div className="flex items-center gap-3">
+          <div className="px-4 pb-3 flex items-center gap-3">
             <div className="flex-1 min-w-0">
               <div className="flex items-center gap-2 mb-1">
-                <span className="text-[#34d399] text-sm font-semibold">✓ Распознано</span>
-                <span className="text-xs text-[#8b92a8] bg-[#0d0f14] px-2 py-0.5 rounded-full">
+                <span className="text-[#34d399] text-xs font-semibold">✓ Распознано</span>
+                <span className="text-xs text-[#4a5068] bg-[#0a0c10] border border-[#1e2235] px-2 py-0.5 rounded-full">
                   {parsedLink.t === 'p' ? '⚡ P2P' : '☁ Relay'}
                 </span>
               </div>
-              <div className="font-mono text-xs text-[#4a5068] truncate">{linkStr.slice(0, 60)}…</div>
+              <p className="font-mono text-xs text-[#2a3050] truncate">{linkStr.slice(0, 56)}…</p>
             </div>
             <button onClick={clearLink}
-              className="shrink-0 text-xs px-3 py-1.5 border border-[#2a2f42] hover:border-red-500/40 hover:text-red-400 rounded-lg text-[#8b92a8] transition-all">
+              className="shrink-0 text-xs px-3 py-1.5 border border-[#1e2235] hover:border-red-500/30 hover:text-red-400 rounded-lg text-[#4a5068] transition-all">
               ✕
             </button>
           </div>
         )}
       </div>
 
-      {/* P2P address selector */}
+      {/* P2P address picker (auto-shown when link parsed) */}
       {parsedLink?.t === 'p' && wanAddr && lanAddr && (
-        <div className="bg-[#161920] border border-[#2a2f42] rounded-xl p-4 space-y-2">
-          <div className="text-xs text-[#8b92a8] font-semibold uppercase tracking-widest mb-2">Адрес подключения</div>
+        <div className="bg-[#0f1117] border border-[#1e2235] rounded-xl p-4">
+          <p className="text-xs text-[#4a5068] uppercase tracking-widest font-semibold mb-3">Адрес подключения</p>
           <div className="grid grid-cols-2 gap-2">
             <button onClick={() => setPeerAddr(wanAddr)}
-              className={`p-3 rounded-lg border text-left transition-all ${
-                peerAddr === wanAddr ? 'border-[#34d399]/50 bg-[#34d399]/8' : 'border-[#2a2f42] hover:border-[#34d399]/30'
+              className={`p-3 rounded-xl border text-left transition-all ${
+                peerAddr === wanAddr
+                  ? 'border-[#34d399]/40 bg-[#34d399]/5'
+                  : 'border-[#1e2235] hover:border-[#2a3050]'
               }`}>
-              <div className="text-xs text-[#8b92a8] mb-1">🌍 Интернет</div>
-              <div className="font-mono text-xs font-bold text-[#34d399]">{wanAddr}</div>
+              <div className="text-xs text-[#4a5068] mb-1">🌍 Интернет</div>
+              <div className="font-mono text-xs font-bold text-[#34d399] truncate">{wanAddr}</div>
             </button>
             <button onClick={() => setPeerAddr(lanAddr)}
-              className={`p-3 rounded-lg border text-left transition-all ${
-                peerAddr === lanAddr ? 'border-[#5b7cfa]/50 bg-[#5b7cfa]/8' : 'border-[#2a2f42] hover:border-[#5b7cfa]/30'
+              className={`p-3 rounded-xl border text-left transition-all ${
+                peerAddr === lanAddr
+                  ? 'border-[#5b7cfa]/40 bg-[#5b7cfa]/5'
+                  : 'border-[#1e2235] hover:border-[#2a3050]'
               }`}>
-              <div className="text-xs text-[#8b92a8] mb-1">📡 Локально</div>
-              <div className="font-mono text-xs font-bold text-[#5b7cfa]">{lanAddr}</div>
+              <div className="text-xs text-[#4a5068] mb-1">📡 Локально</div>
+              <div className="font-mono text-xs font-bold text-[#5b7cfa] truncate">{lanAddr}</div>
             </button>
           </div>
         </div>
       )}
 
-      {/* Manual fields */}
+      {/* Manual fields toggle */}
       {!parsedLink && (
-        <>
-          <div className="flex gap-1 bg-[#0d0f14] border border-[#2a2f42] rounded-xl p-1">
-            {([['p2p', '⚡ P2P Direct'], ['relay', '☁ Relay']] as [Mode, string][]).map(([m, label]) => (
-              <button key={m} onClick={() => { setMode(m as Mode); reset() }}
-                className={`flex-1 py-2 text-sm font-semibold rounded-lg transition-all ${
-                  mode === m ? 'bg-gradient-to-r from-[#5b7cfa] to-[#a78bfa] text-white shadow' : 'text-[#8b92a8] hover:text-[#e4e7f0]'
-                }`}>{label}</button>
-            ))}
-          </div>
+        <button onClick={() => setShowManual(v => !v)}
+          className="flex items-center gap-1.5 text-xs text-[#2a3050] hover:text-[#4a5068] transition-colors px-1 py-0.5">
+          <span className={`transition-transform ${showManual ? 'rotate-90' : ''}`}>▶</span>
+          Заполнить вручную
+        </button>
+      )}
 
-          <div className="bg-[#161920] border border-[#2a2f42] rounded-xl p-5 space-y-3">
-            {mode === 'p2p' ? (
-              <>
-                <Field label="Peer Address">
-                  <input type="text" value={peerAddr} onChange={e => setPeerAddr(e.target.value)}
-                    placeholder="192.168.1.5:54321"
-                    className="w-full bg-[#0d0f14] border border-[#2a2f42] focus:border-[#5b7cfa] rounded-lg px-3 py-2 text-sm outline-none font-mono text-[#5b7cfa]" />
-                </Field>
-                <div className="grid grid-cols-2 gap-3">
-                  <Field label="Код">
-                    <input type="text" value={code} onChange={e => setCode(e.target.value.toUpperCase())}
-                      placeholder="ABCD1234" maxLength={8}
-                      className="w-full bg-[#0d0f14] border border-[#2a2f42] focus:border-[#5b7cfa] rounded-lg px-3 py-2 text-sm outline-none font-mono font-bold tracking-widest text-[#5b7cfa]" />
-                  </Field>
-                  <KeyField value={key} onChange={setKey} visible={keyVisible} onToggle={() => setKeyVisible(v => !v)} />
-                </div>
-              </>
-            ) : (
-              <>
-                <Field label="Server URL">
-                  <input type="text" value={serverURL} onChange={e => setServerURL(e.target.value)}
-                    placeholder="http://192.168.1.5:8080"
-                    className="w-full bg-[#0d0f14] border border-[#2a2f42] focus:border-[#5b7cfa] rounded-lg px-3 py-2 text-sm outline-none font-mono" />
-                </Field>
-                <div className="grid grid-cols-2 gap-3">
-                  <Field label="Transfer Code">
-                    <input type="text" value={code} onChange={e => setCode(e.target.value.toUpperCase())}
-                      placeholder="ABCD1234" maxLength={8}
-                      className="w-full bg-[#0d0f14] border border-[#2a2f42] focus:border-[#5b7cfa] rounded-lg px-3 py-2 text-sm outline-none font-mono font-bold tracking-widest text-[#5b7cfa]" />
-                  </Field>
-                  <KeyField value={key} onChange={setKey} visible={keyVisible} onToggle={() => setKeyVisible(v => !v)} />
-                </div>
-                <Field label="Потоки">
-                  <select value={workers} onChange={e => setWorkers(Number(e.target.value))}
-                    className="bg-[#0d0f14] border border-[#2a2f42] rounded-lg px-3 py-2 text-sm outline-none">
-                    <option value={4}>4</option><option value={8}>8</option><option value={16}>16</option>
-                  </select>
-                </Field>
-              </>
-            )}
+      {/* Manual input fields */}
+      {!parsedLink && showManual && (
+        <div className="bg-[#0f1117] border border-[#1e2235] rounded-xl p-4 space-y-3">
+          <FormField label="Адрес отправителя (IP:PORT)">
+            <input type="text" value={peerAddr} onChange={e => setPeerAddr(e.target.value)}
+              placeholder="77.88.55.60:54321"
+              className="w-full bg-[#0a0c10] border border-[#1e2235] focus:border-[#5b7cfa] rounded-lg px-3 py-2 text-xs outline-none font-mono text-[#5b7cfa]" />
+          </FormField>
+          <div className="grid grid-cols-2 gap-3">
+            <FormField label="Код">
+              <input type="text" value={code} onChange={e => setCode(e.target.value.toUpperCase())}
+                placeholder="ABCD1234" maxLength={8}
+                className="w-full bg-[#0a0c10] border border-[#1e2235] focus:border-[#5b7cfa] rounded-lg px-3 py-2 text-xs outline-none font-mono font-bold tracking-widest text-[#a78bfa]" />
+            </FormField>
+            <KeyField value={key} onChange={setKey} visible={keyVisible} onToggle={() => setKeyVisible(v => !v)} />
           </div>
-        </>
+          <FormField label="Relay URL (опционально)">
+            <input type="text" value={relayURL} onChange={e => setRelayURL(e.target.value)}
+              placeholder="http://192.168.1.5:8080"
+              className="w-full bg-[#0a0c10] border border-[#1e2235] focus:border-[#5b7cfa] rounded-lg px-3 py-2 text-xs outline-none font-mono text-[#8b92a8]" />
+          </FormField>
+        </div>
       )}
 
       {/* Save location */}
-      <div className="bg-[#161920] border border-[#2a2f42] rounded-xl px-5 py-4">
-        <label className="block text-xs text-[#8b92a8] mb-1.5">Сохранить в</label>
+      <div className="bg-[#0f1117] border border-[#1e2235] rounded-xl px-4 py-3.5">
+        <label className="block text-xs text-[#4a5068] mb-1.5">Сохранить в</label>
         <div className="flex gap-2">
           <input type="text" value={outDir} onChange={e => setOutDir(e.target.value)}
             placeholder="Папка загрузок (по умолчанию)"
-            className="flex-1 bg-[#0d0f14] border border-[#2a2f42] focus:border-[#5b7cfa] rounded-lg px-3 py-2 text-sm outline-none font-mono" />
+            className="flex-1 bg-[#0a0c10] border border-[#1e2235] focus:border-[#5b7cfa] rounded-lg px-3 py-2 text-xs outline-none font-mono text-[#8b92a8]" />
           <button onClick={pickDir}
-            className="px-3 py-2 border border-[#2a2f42] hover:border-[#5b7cfa] rounded-lg text-sm text-[#8b92a8] hover:text-[#e4e7f0]">
+            className="px-3 py-2 border border-[#1e2235] hover:border-[#5b7cfa]/40 rounded-lg text-xs text-[#4a5068] hover:text-[#8b92a8] transition-all">
             Обзор
           </button>
         </div>
@@ -326,7 +282,7 @@ export default function ReceivePanel({ defaultServerURL }: { defaultServerURL: s
 
       {/* Error */}
       {phase === 'error' && error && (
-        <div className="bg-red-500/10 border border-red-500/30 text-red-400 rounded-xl px-4 py-3 text-sm">{error}</div>
+        <div className="bg-red-500/8 border border-red-500/20 text-red-400 rounded-xl px-4 py-3 text-sm">{error}</div>
       )}
 
       {/* Receive button */}
@@ -334,18 +290,20 @@ export default function ReceivePanel({ defaultServerURL }: { defaultServerURL: s
         className={`w-full py-3.5 rounded-xl font-bold text-sm transition-all ${
           canStart
             ? 'bg-gradient-to-r from-[#5b7cfa] to-[#a78bfa] text-white hover:opacity-90 hover:-translate-y-0.5 shadow-lg shadow-[#5b7cfa]/20'
-            : 'bg-[#1e2230] text-[#4a5068] cursor-not-allowed'
+            : 'bg-[#0f1117] text-[#2a3050] border border-[#1e2235] cursor-not-allowed'
         }`}>
-        {mode === 'p2p' ? '⚡ Получить (P2P)' : '↓ Скачать с Relay'}
+        ⚡ Получить файл
       </button>
     </div>
   )
 }
 
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
+// ── Sub-components ────────────────────────────────────────────────────────────
+
+function FormField({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <div>
-      <label className="block text-xs text-[#8b92a8] mb-1.5">{label}</label>
+      <label className="block text-xs text-[#4a5068] mb-1.5">{label}</label>
       {children}
     </div>
   )
@@ -355,16 +313,20 @@ function KeyField({ value, onChange, visible, onToggle }: {
   value: string; onChange: (v: string) => void; visible: boolean; onToggle: () => void
 }) {
   return (
-    <Field label="Ключ шифрования">
+    <FormField label="Ключ">
       <div className="flex gap-1">
-        <input type={visible ? 'text' : 'password'} value={value} onChange={e => onChange(e.target.value)}
+        <input
+          type={visible ? 'text' : 'password'}
+          value={value}
+          onChange={e => onChange(e.target.value)}
           placeholder="Вставьте ключ"
-          className="flex-1 bg-[#0d0f14] border border-[#2a2f42] focus:border-[#a78bfa] rounded-lg px-3 py-2 text-xs outline-none font-mono" />
+          className="flex-1 bg-[#0a0c10] border border-[#1e2235] focus:border-[#a78bfa] rounded-lg px-3 py-2 text-xs outline-none font-mono text-[#8b92a8]"
+        />
         <button onClick={onToggle}
-          className="px-2 border border-[#2a2f42] rounded-lg text-[#8b92a8] hover:text-[#e4e7f0] text-sm">
+          className="px-2 border border-[#1e2235] rounded-lg text-[#4a5068] hover:text-[#8b92a8] text-sm transition-colors">
           {visible ? '🙈' : '👁'}
         </button>
       </div>
-    </Field>
+    </FormField>
   )
 }

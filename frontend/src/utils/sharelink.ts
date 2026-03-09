@@ -1,12 +1,13 @@
 const PREFIX = 'QNL:'
 
-// P2P link: direct TCP connection
+// P2P link: direct TCP connection (+ hole punch + relay fallback)
 export interface P2PLink {
   t: 'p'
-  w: string // WAN address (may be empty)
-  l: string // LAN address
-  c: string // auth code
-  k: string // AES-256 key
+  w: string  // WAN address (may be empty)
+  l: string  // LAN address
+  c: string  // auth code
+  k: string  // AES-256 key
+  r?: string // relay URL for rendezvous signaling + streaming fallback
 }
 
 // Relay link: via embedded HTTP server

@@ -42,6 +42,7 @@ type InitiateRequest struct {
 	FileSize    int64  `json:"fileSize"`
 	TotalChunks int    `json:"totalChunks"`
 	ChunkSize   int64  `json:"chunkSize"`
+	FileHash    string `json:"fileHash,omitempty"`
 }
 
 type InitiateResponse struct {
@@ -55,6 +56,7 @@ type TransferInfo struct {
 	FileSize       int64         `json:"fileSize"`
 	TotalChunks    int           `json:"totalChunks"`
 	ChunkSize      int64         `json:"chunkSize"`
+	FileHash       string        `json:"fileHash,omitempty"`
 	UploadedChunks int           `json:"uploadedChunks"`
 	UploadedMap    []bool        `json:"uploadedMap"`
 	Status         domain.Status `json:"status"`
@@ -93,6 +95,7 @@ func (s *Service) Initiate(req InitiateRequest) (*InitiateResponse, error) {
 		FileSize:    req.FileSize,
 		TotalChunks: req.TotalChunks,
 		ChunkSize:   req.ChunkSize,
+		FileHash:    req.FileHash,
 		Status:      domain.StatusPending,
 		Uploaded:    make([]bool, req.TotalChunks),
 		CreatedAt:   time.Now(),
@@ -234,6 +237,15 @@ func sanitizeFilename(name string) string {
 	if result == "" || result == "." || result == ".." {
 		result = "file"
 	}
+	// Prevent excessively long filenames (filesystem limit is 255 bytes on most OSes).
+	if len(result) > 255 {
+		ext := filepath.Ext(result)
+		if len(ext) < 255 {
+			result = result[:255-len(ext)] + ext
+		} else {
+			result = result[:255]
+		}
+	}
 	return result
 }
 
@@ -244,6 +256,7 @@ func toInfo(t *domain.Transfer) *TransferInfo {
 		FileSize:       t.FileSize,
 		TotalChunks:    t.TotalChunks,
 		ChunkSize:      t.ChunkSize,
+		FileHash:       t.FileHash,
 		UploadedChunks: t.UploadedCount(),
 		UploadedMap:    t.Uploaded,
 		Status:         t.Status,

@@ -1,0 +1,39 @@
+# ── Binaries ──────────────────────────────────────────────────────────────────
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+
+# ── Go ────────────────────────────────────────────────────────────────────────
+/vendor/
+coverage.out
+coverage.html
+
+# ── Build output ──────────────────────────────────────────────────────────────
+build/bin/
+build/windows/installer/tmp/
+
+# ── Frontend: dependencies and build output ───────────────────────────────────
+frontend/node_modules/
+frontend/dist/
+frontend/package.json.md5
+cmd/web/dist/
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.iml
+
+# ── Claude Code ───────────────────────────────────────────────────────────────
+.claude/
+
+# ── Relay data storage ────────────────────────────────────────────────────────
+data/
+build/bin/data/
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+*.tmp

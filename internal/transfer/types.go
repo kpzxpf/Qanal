@@ -15,6 +15,7 @@ type ProgressFn func(ProgressEvent)
 
 // SendResult contains the transfer credentials after a successful upload.
 type SendResult struct {
-	Code string `json:"code"`
-	Key  string `json:"key"`
+	Code     string `json:"code"`
+	Key      string `json:"key"`
+	FileHash string `json:"fileHash,omitempty"` // SHA-256 hex for integrity verification
 }

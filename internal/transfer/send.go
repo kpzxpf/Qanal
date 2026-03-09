@@ -15,6 +15,7 @@ import (
 )
 
 // Send uploads filePath to serverURL in parallel encrypted chunks.
+// Pass chunkMB=0 to auto-select based on measured RTT (adaptive mode).
 // Cancelling ctx immediately aborts all in-flight HTTP requests and workers.
 func Send(ctx context.Context, serverURL, filePath string, chunkMB, workers int, progress ProgressFn) (*SendResult, error) {
 	f, stat, err := openFileInfo(filePath)
@@ -25,10 +26,12 @@ func Send(ctx context.Context, serverURL, filePath string, chunkMB, workers int,
 
 	fileSize := stat.Size()
 	fileName := stat.Name()
-	chunkSize := int64(chunkMB) * 1024 * 1024
-	totalChunks := int((fileSize + chunkSize - 1) / chunkSize)
-	if totalChunks == 0 {
-		totalChunks = 1
+
+	// Compute SHA-256 before chunking. ReadAt workers are unaffected because
+	// ReadAt bypasses the sequential file position used by io.Copy.
+	fileHash, err := computeFileHash(f)
+	if err != nil {
+		return nil, fmt.Errorf("hash file: %w", err)
 	}
 
 	keyBytes := make([]byte, 32)
@@ -42,7 +45,7 @@ func Send(ctx context.Context, serverURL, filePath string, chunkMB, workers int,
 		Transport: &http.Transport{
 			MaxIdleConnsPerHost:   workers * 2,
 			MaxConnsPerHost:       workers * 2,
-			DisableCompression:    true, // data is AES-encrypted (random bytes), gzip adds overhead
+			DisableCompression:    true,
 			IdleConnTimeout:       90 * time.Second,
 			TLSHandshakeTimeout:   10 * time.Second,
 			ResponseHeaderTimeout: 30 * time.Second,
@@ -50,12 +53,22 @@ func Send(ctx context.Context, serverURL, filePath string, chunkMB, workers int,
 		},
 	}
 
-	code, err := createTransfer(ctx, client, serverURL, fileName, fileSize, totalChunks, chunkSize)
+	// Auto-select chunk size based on measured RTT when chunkMB is not specified.
+	if chunkMB <= 0 {
+		chunkMB = adaptiveChunkMB(ctx, client, serverURL)
+	}
+
+	chunkSize := int64(chunkMB) * 1024 * 1024
+	totalChunks := int((fileSize + chunkSize - 1) / chunkSize)
+	if totalChunks == 0 {
+		totalChunks = 1
+	}
+
+	code, err := createTransfer(ctx, client, serverURL, fileName, fileSize, totalChunks, chunkSize, fileHash)
 	if err != nil {
 		return nil, err
 	}
 
-	// Pool of plaintext buffers — avoids repeated large allocations.
 	plainPool := &sync.Pool{
 		New: func() any {
 			b := make([]byte, chunkSize)
@@ -63,7 +76,6 @@ func Send(ctx context.Context, serverURL, filePath string, chunkMB, workers int,
 		},
 	}
 
-	// Worker cancellation: first error cancels remaining workers.
 	workerCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -158,21 +170,58 @@ func Send(ctx context.Context, serverURL, filePath string, chunkMB, workers int,
 	if err := completeTransfer(ctx, client, serverURL, code); err != nil {
 		return nil, err
 	}
-	return &SendResult{Code: code, Key: keyB64}, nil
+	return &SendResult{Code: code, Key: keyB64, FileHash: fileHash}, nil
 }
 
-func createTransfer(ctx context.Context, client *http.Client, serverURL, fileName string, fileSize int64, totalChunks int, chunkSize int64) (string, error) {
+// adaptiveChunkMB measures one round-trip to the relay and returns a chunk size
+// tuned for the observed latency. Larger chunks reduce per-chunk overhead on fast
+// links; smaller chunks reduce timeout risk on high-latency links.
+func adaptiveChunkMB(ctx context.Context, client *http.Client, serverURL string) int {
+	tCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(tCtx, http.MethodGet, serverURL+"/health", nil)
+	if err != nil {
+		return 16
+	}
+	start := time.Now()
+	r, err := client.Do(req)
+	if err != nil {
+		return 16
+	}
+	r.Body.Close()
+	rtt := time.Since(start)
+
+	switch {
+	case rtt < 5*time.Millisecond:
+		return 64 // LAN: large chunks, minimal HTTP overhead
+	case rtt < 30*time.Millisecond:
+		return 32 // Fast WAN / local relay
+	case rtt < 100*time.Millisecond:
+		return 16 // Typical internet
+	default:
+		return 8 // High-latency / satellite: smaller chunks reduce timeout risk
+	}
+}
+
+func createTransfer(ctx context.Context, client *http.Client, serverURL, fileName string, fileSize int64, totalChunks int, chunkSize int64, fileHash string) (string, error) {
 	type req struct {
 		FileName    string `json:"fileName"`
 		FileSize    int64  `json:"fileSize"`
 		TotalChunks int    `json:"totalChunks"`
 		ChunkSize   int64  `json:"chunkSize"`
+		FileHash    string `json:"fileHash,omitempty"`
 	}
 	type resp struct {
 		Code string `json:"code"`
 	}
-	body, _ := json.Marshal(req{fileName, fileSize, totalChunks, chunkSize})
-	httpReq, _ := http.NewRequestWithContext(ctx, http.MethodPost, serverURL+"/api/v1/transfers", bytes.NewReader(body))
+	body, err := json.Marshal(req{fileName, fileSize, totalChunks, chunkSize, fileHash})
+	if err != nil {
+		return "", fmt.Errorf("marshal create request: %w", err)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, serverURL+"/api/v1/transfers", bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("build create request: %w", err)
+	}
 	httpReq.Header.Set("Content-Type", "application/json")
 
 	r, err := client.Do(httpReq)
@@ -185,7 +234,9 @@ func createTransfer(ctx context.Context, client *http.Client, serverURL, fileNam
 		return "", fmt.Errorf("server error %d: %s", r.StatusCode, string(b))
 	}
 	var out resp
-	json.NewDecoder(r.Body).Decode(&out)
+	if err := json.NewDecoder(r.Body).Decode(&out); err != nil {
+		return "", fmt.Errorf("decode create response: %w", err)
+	}
 	return out.Code, nil
 }
 

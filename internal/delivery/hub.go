@@ -78,7 +78,7 @@ func (h *Hub) Run(ctx context.Context) {
 				select {
 				case c.send <- b.data:
 				default:
-					// slow client — drop message
+					slog.Warn("hub: slow client, dropping progress message", "code", b.code)
 				}
 			}
 		}

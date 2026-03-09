@@ -114,7 +114,19 @@ func (r *FileTransferRepo) writeToDisk(t *domain.Transfer) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(r.metaPath(t.Code), data, 0644)
+	f, err := os.OpenFile(r.metaPath(t.Code), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 func (r *FileTransferRepo) Save(t *domain.Transfer) error {

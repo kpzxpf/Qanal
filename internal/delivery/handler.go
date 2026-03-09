@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strconv"
 	"sync"
+	"time"
 
 	"Qanal/internal/domain"
 	"Qanal/internal/usecase"
@@ -38,15 +39,6 @@ type HubPort interface {
 }
 
 var (
-	upgrader = websocket.Upgrader{
-		ReadBufferSize:  4096,
-		WriteBufferSize: 4096,
-		// Only allow same-machine browser origins (Wails WebView or localhost dev).
-		CheckOrigin: func(r *http.Request) bool {
-			return isLocalOrigin(r.Header.Get("Origin"))
-		},
-	}
-
 	// downloadBufPool avoids a 4 MB allocation on every chunk download.
 	downloadBufPool = sync.Pool{
 		New: func() any {
@@ -57,13 +49,44 @@ var (
 )
 
 type Handler struct {
-	svc     ServicePort
-	hub     HubPort
-	limiter *ipLimiter
+	svc        ServicePort
+	hub        HubPort
+	limiter    *ipLimiter
+	streams    *streamHub     // zero-storage live streaming relay
+	rdv        *rendezvousHub // P2P signaling / rendezvous
+	publicCORS bool           // when true: allow any origin (web/Docker mode)
 }
 
-func NewHandler(svc ServicePort, hub HubPort) *Handler {
-	return &Handler{svc: svc, hub: hub, limiter: newIPLimiter()}
+// HandlerOpts configures optional Handler behaviour.
+type HandlerOpts struct {
+	// PublicCORS allows any browser origin. Use in Docker/web deployments.
+	PublicCORS bool
+}
+
+func NewHandler(svc ServicePort, hub HubPort, opts ...HandlerOpts) *Handler {
+	h := &Handler{svc: svc, hub: hub, limiter: newIPLimiter(), streams: newStreamHub(), rdv: newRendezvousHub()}
+	if len(opts) > 0 {
+		h.publicCORS = opts[0].PublicCORS
+	}
+	return h
+}
+
+func (h *Handler) wsUpgrader() websocket.Upgrader {
+	if h.publicCORS {
+		return websocket.Upgrader{
+			ReadBufferSize:  4096,
+			WriteBufferSize: 4096,
+			CheckOrigin:     func(*http.Request) bool { return true },
+		}
+	}
+	return websocket.Upgrader{
+		ReadBufferSize:  4096,
+		WriteBufferSize: 4096,
+		// Only allow same-machine browser origins (Wails WebView or localhost dev).
+		CheckOrigin: func(r *http.Request) bool {
+			return isLocalOrigin(r.Header.Get("Origin"))
+		},
+	}
 }
 
 // Close stops the background goroutines owned by the handler (rate limiter).
@@ -75,11 +98,22 @@ func (h *Handler) Router() http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Recoverer)
-	r.Use(corsMiddleware)
+	r.Use(h.corsMiddleware)
 
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
 		jsonOK(w, map[string]string{"status": "ok"}, http.StatusOK)
 	})
+
+	// Echoes the caller's external TCP address — used by peers to discover
+	// their NAT-mapped address without STUN (TCP-level, not UDP).
+	r.Get("/myaddr", func(w http.ResponseWriter, r *http.Request) {
+		jsonOK(w, map[string]string{"addr": r.RemoteAddr}, http.StatusOK)
+	})
+
+	// P2P rendezvous signaling — tiny JSON messages only, no file data.
+	r.Post("/api/v1/p2p/register", h.rdv.handleRegister)
+	r.Get("/api/v1/p2p/wait/{code}", h.rdv.handleWait)
+	r.Post("/api/v1/p2p/meet/{code}", h.rdv.handleMeet)
 
 	r.Route("/api/v1", func(r chi.Router) {
 		r.With(h.rateLimitMiddleware).Post("/transfers", h.createTransfer)
@@ -91,6 +125,13 @@ func (h *Handler) Router() http.Handler {
 	})
 
 	r.Get("/ws/{code}", h.handleWS)
+
+	// Zero-storage streaming relay: sender and receiver exchange data in real-time
+	// without disk I/O. Both must be online simultaneously.
+	// POST /api/v1/stream/{code}  — sender pushes the encrypted data stream
+	// GET  /api/v1/stream/{code}  — receiver subscribes and pulls the stream
+	r.Post("/api/v1/stream/{code}", h.streamSend)
+	r.Get("/api/v1/stream/{code}", h.streamRecv)
 
 	return r
 }
@@ -217,7 +258,8 @@ func (h *Handler) deleteTransfer(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleWS(w http.ResponseWriter, r *http.Request) {
 	code := chi.URLParam(r, "code")
-	conn, err := upgrader.Upgrade(w, r, nil)
+	u := h.wsUpgrader()
+	conn, err := u.Upgrade(w, r, nil)
 	if err != nil {
 		return
 	}
@@ -236,10 +278,12 @@ func jsonError(w http.ResponseWriter, msg string, status int) {
 	json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 
-func corsMiddleware(next http.Handler) http.Handler {
+func (h *Handler) corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
-		if isLocalOrigin(origin) && origin != "" {
+		if h.publicCORS {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+		} else if isLocalOrigin(origin) && origin != "" {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 		}
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
@@ -265,4 +309,32 @@ func isLocalOrigin(origin string) bool {
 	}
 	host := u.Hostname() // strips port
 	return host == "localhost" || host == "127.0.0.1" || host == "::1"
+}
+
+func (h *Handler) streamSend(w http.ResponseWriter, r *http.Request) {
+	code := chi.URLParam(r, "code")
+	if err := h.streams.waitAndPipe(code, r.Body, 5*time.Minute); err != nil {
+		slog.Warn("stream send failed", "code", code, "err", err)
+		jsonError(w, err.Error(), http.StatusGatewayTimeout)
+		return
+	}
+	jsonOK(w, map[string]string{"status": "ok"}, http.StatusOK)
+}
+
+func (h *Handler) streamRecv(w http.ResponseWriter, r *http.Request) {
+	code := chi.URLParam(r, "code")
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+
+	flusher, canFlush := w.(http.Flusher)
+	if canFlush {
+		flusher.Flush()
+	}
+
+	if err := h.streams.subscribe(code, w, 5*time.Minute); err != nil {
+		slog.Warn("stream recv failed", "code", code, "err", err)
+		// Headers already written — log only, cannot send JSON error.
+		return
+	}
 }

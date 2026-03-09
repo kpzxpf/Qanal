@@ -8,11 +8,10 @@ import (
 )
 
 const (
-	// maxTransfersPerWindow is the maximum number of new transfers a single IP
-	// may initiate within windowDuration. This prevents relay server abuse.
 	maxTransfersPerWindow = 10
 	windowDuration        = time.Minute
 	cleanupInterval       = 5 * time.Minute
+	maxTrackedIPs         = 10_000 // cap against DDoS memory exhaustion
 )
 
 type windowEntry struct {
@@ -20,9 +19,6 @@ type windowEntry struct {
 	resetAt time.Time
 }
 
-// ipLimiter is a simple sliding-window rate limiter keyed by client IP.
-// It is safe for concurrent use and cleans up stale entries periodically.
-// Call Close() to stop the background cleanup goroutine.
 type ipLimiter struct {
 	mu      sync.Mutex
 	windows map[string]*windowEntry
@@ -38,16 +34,14 @@ func newIPLimiter() *ipLimiter {
 	return l
 }
 
-// Close stops the background cleanup goroutine.
 func (l *ipLimiter) Close() {
 	close(l.stopCh)
 }
 
-// Allow returns true if the request from remoteAddr is within the rate limit.
 func (l *ipLimiter) Allow(remoteAddr string) bool {
 	ip, _, err := net.SplitHostPort(remoteAddr)
 	if err != nil {
-		ip = remoteAddr // no port present, use as-is
+		ip = remoteAddr
 	}
 
 	l.mu.Lock()
@@ -56,6 +50,9 @@ func (l *ipLimiter) Allow(remoteAddr string) bool {
 	now := time.Now()
 	w, ok := l.windows[ip]
 	if !ok || now.After(w.resetAt) {
+		if !ok && len(l.windows) >= maxTrackedIPs {
+			l.evictOldest()
+		}
 		l.windows[ip] = &windowEntry{count: 1, resetAt: now.Add(windowDuration)}
 		return true
 	}
@@ -63,8 +60,22 @@ func (l *ipLimiter) Allow(remoteAddr string) bool {
 	return w.count <= maxTransfersPerWindow
 }
 
-// cleanup removes expired entries every cleanupInterval to bound memory growth.
-// Exits when Close() is called.
+// evictOldest removes the entry with the earliest resetAt time.
+// Called with l.mu held.
+func (l *ipLimiter) evictOldest() {
+	var oldestIP string
+	var oldestTime time.Time
+	for ip, w := range l.windows {
+		if oldestIP == "" || w.resetAt.Before(oldestTime) {
+			oldestIP = ip
+			oldestTime = w.resetAt
+		}
+	}
+	if oldestIP != "" {
+		delete(l.windows, oldestIP)
+	}
+}
+
 func (l *ipLimiter) cleanup() {
 	ticker := time.NewTicker(cleanupInterval)
 	defer ticker.Stop()
@@ -85,8 +96,6 @@ func (l *ipLimiter) cleanup() {
 	}
 }
 
-// rateLimitMiddleware rejects requests that exceed the per-IP rate limit with
-// HTTP 429 Too Many Requests and a Retry-After header.
 func (h *Handler) rateLimitMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !h.limiter.Allow(r.RemoteAddr) {

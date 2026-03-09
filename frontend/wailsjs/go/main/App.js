@@ -18,8 +18,8 @@ export function GetLocalServerURL() {
   return window['go']['main']['App']['GetLocalServerURL']();
 }
 
-export function PeerReceive(arg1, arg2, arg3, arg4) {
-  return window['go']['main']['App']['PeerReceive'](arg1, arg2, arg3, arg4);
+export function PeerReceive(arg1, arg2, arg3, arg4, arg5) {
+  return window['go']['main']['App']['PeerReceive'](arg1, arg2, arg3, arg4, arg5);
 }
 
 export function ReceiveFile(arg1, arg2, arg3, arg4, arg5) {

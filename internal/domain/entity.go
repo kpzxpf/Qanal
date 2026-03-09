@@ -29,6 +29,7 @@ type Transfer struct {
 	FileSize    int64     `json:"fileSize"`
 	TotalChunks int       `json:"totalChunks"`
 	ChunkSize   int64     `json:"chunkSize"`
+	FileHash    string    `json:"fileHash,omitempty"` // SHA-256 hex of original file
 	Status      Status    `json:"status"`
 	Uploaded    []bool    `json:"uploaded"`
 	CreatedAt   time.Time `json:"createdAt"`
