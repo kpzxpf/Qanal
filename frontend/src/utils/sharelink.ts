@@ -1,24 +1,15 @@
 const PREFIX = 'QNL:'
 
-// P2P link: direct TCP connection (+ hole punch + relay fallback)
+// P2PLink: direct TCP connection credentials embedded in a share string.
 export interface P2PLink {
   t: 'p'
-  w: string  // WAN address (may be empty)
-  l: string  // LAN address
-  c: string  // auth code
-  k: string  // AES-256 key
-  r?: string // relay URL for rendezvous signaling + streaming fallback
+  w: string // WAN address (public internet); may be empty if unreachable
+  l: string // LAN address (local network)
+  c: string // auth code (8 uppercase base32 chars)
+  k: string // AES-256-GCM key (base64url, 32 bytes)
 }
 
-// Relay link: via embedded HTTP server
-export interface RelayLink {
-  t: 'r'
-  s: string // server URL
-  c: string // transfer code
-  k: string // AES-256 key
-}
-
-export type ShareLink = P2PLink | RelayLink
+export type ShareLink = P2PLink
 
 export function encodeLink(link: ShareLink): string {
   const b64 = btoa(JSON.stringify(link))
@@ -34,7 +25,7 @@ export function decodeLink(s: string): ShareLink | null {
   try {
     const b64 = trimmed.slice(PREFIX.length).replace(/-/g, '+').replace(/_/g, '/')
     const obj = JSON.parse(atob(b64))
-    if (obj.t !== 'p' && obj.t !== 'r') return null
+    if (obj.t !== 'p') return null
     return obj as ShareLink
   } catch {
     return null

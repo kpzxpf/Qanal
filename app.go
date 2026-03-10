@@ -5,17 +5,10 @@ import (
 	"encoding/base64"
 	"fmt"
 	"log/slog"
-	"net"
-	"net/http"
 	"os"
 	"sync"
-	"time"
 
-	"Qanal/internal/config"
-	"Qanal/internal/delivery"
-	"Qanal/internal/infrastructure"
 	"Qanal/internal/transfer"
-	"Qanal/internal/usecase"
 
 	qrcode "github.com/skip2/go-qrcode"
 	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
@@ -23,42 +16,30 @@ import (
 
 // App is the Wails application — all exported methods are bound to the frontend.
 type App struct {
-	ctx           context.Context
-	server        *http.Server
-	port          int
-	peers         peerManager
-	cleanupCancel context.CancelFunc
-	handler       *delivery.Handler
-	repo          *infrastructure.FileTransferRepo
+	ctx   context.Context
+	peers peerManager
 }
 
-// peerManager owns the lifecycle of a single active P2P sender session.
+// peerManager owns the lifecycle of one active P2P sender session.
 type peerManager struct {
 	mu     sync.Mutex
 	server *transfer.PeerServer
+	cancel context.CancelFunc
 }
 
-func (m *peerManager) start(filePath, relayURL string, chunkMB int) (*transfer.PeerInfo, *transfer.PeerServer, error) {
+func (m *peerManager) set(ps *transfer.PeerServer, cancel context.CancelFunc) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-
-	if m.server != nil {
-		m.server.Close()
-		m.server = nil
-	}
-	ps, err := transfer.StartPeer(filePath, relayURL, chunkMB)
-	if err != nil {
-		return nil, nil, err
-	}
 	m.server = ps
-	return ps.Info, ps, nil
+	m.cancel = cancel
 }
 
-func (m *peerManager) compareAndClear(ps *transfer.PeerServer) {
+func (m *peerManager) clear(ps *transfer.PeerServer) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.server == ps {
 		m.server = nil
+		m.cancel = nil
 	}
 }
 
@@ -69,95 +50,25 @@ func (m *peerManager) stop() {
 		m.server.Close()
 		m.server = nil
 	}
+	if m.cancel != nil {
+		m.cancel()
+		m.cancel = nil
+	}
 }
 
 func NewApp() *App { return &App{} }
 
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
-	// Emit 'file:dropped' when user drags a file onto the window.
 	wailsruntime.OnFileDrop(ctx, func(x, y int, paths []string) {
 		if len(paths) > 0 {
 			wailsruntime.EventsEmit(ctx, "file:dropped", map[string]string{"path": paths[0]})
 		}
 	})
-	if err := a.startRelayServer(); err != nil {
-		slog.Error("relay server failed", "err", err)
-	}
 }
 
-func (a *App) shutdown(ctx context.Context) {
-	if a.cleanupCancel != nil {
-		a.cleanupCancel()
-	}
-	if a.server != nil {
-		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		a.server.Shutdown(shutCtx)
-	}
-	if a.handler != nil {
-		a.handler.Close()
-	}
-	if a.repo != nil {
-		a.repo.Close()
-	}
+func (a *App) shutdown(_ context.Context) {
 	a.peers.stop()
-}
-
-// ─── Embedded relay server ────────────────────────────────────────────────────
-
-func (a *App) startRelayServer() error {
-	cfg := config.Load()
-	a.port = findFreePort(8080)
-	cfg.Addr = fmt.Sprintf(":%d", a.port)
-
-	repo, err := infrastructure.NewFileTransferRepo(cfg.StoragePath)
-	if err != nil {
-		return fmt.Errorf("init storage: %w", err)
-	}
-	a.repo = repo
-	store := infrastructure.NewFileChunkStore(cfg.StoragePath)
-	hub := delivery.NewHub()
-	cleanupCtx, cancel := context.WithCancel(context.Background())
-	a.cleanupCancel = cancel
-	go hub.Run(cleanupCtx)
-
-	svc := usecase.NewService(repo, store, hub, usecase.Config{
-		MaxFileSize:  cfg.MaxFileSize,
-		MaxChunkSize: cfg.MaxChunkSize,
-		TransferTTL:  cfg.TransferTTL,
-	})
-	go svc.CleanupExpired(cleanupCtx, 5*time.Minute)
-
-	h := delivery.NewHandler(svc, hub)
-	a.handler = h
-	a.server = &http.Server{
-		Addr:        cfg.Addr,
-		Handler:     h.Router(),
-		IdleTimeout: 120 * time.Second,
-	}
-	go func() {
-		if err := a.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			slog.Error("relay server", "err", err)
-		}
-	}()
-	return nil
-}
-
-func findFreePort(start int) int {
-	for port := start; port < start+20; port++ {
-		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
-		if err == nil {
-			ln.Close()
-			return port
-		}
-	}
-	return start
-}
-
-// GetLocalServerURL returns the LAN URL of the embedded relay server.
-func (a *App) GetLocalServerURL() string {
-	return fmt.Sprintf("http://%s:%d", transfer.GetLocalIP(), a.port)
 }
 
 // ─── File dialogs ─────────────────────────────────────────────────────────────
@@ -185,53 +96,35 @@ func (a *App) GetFileInfo(path string) (*transfer.FileInfo, error) {
 	return transfer.GetFileInfo(path)
 }
 
-// ─── Relay transfer ───────────────────────────────────────────────────────────
-
-// SendFile uploads the file via the embedded relay server.
-func (a *App) SendFile(serverURL, filePath string, chunkMB, workers int) (*transfer.SendResult, error) {
-	result, err := transfer.Send(a.ctx, serverURL, filePath, chunkMB, workers, func(e transfer.ProgressEvent) {
-		wailsruntime.EventsEmit(a.ctx, "transfer:progress", e)
-	})
-	if err != nil {
-		wailsruntime.EventsEmit(a.ctx, "transfer:error", map[string]string{"message": err.Error()})
-		return nil, err
-	}
-	wailsruntime.EventsEmit(a.ctx, "transfer:complete", map[string]string{"code": result.Code, "key": result.Key})
-	return result, nil
-}
-
-// ReceiveFile downloads and decrypts via the relay server.
-func (a *App) ReceiveFile(serverURL, code, keyB64, outputDir string, workers int) (string, error) {
-	outPath, err := transfer.Receive(a.ctx, serverURL, code, keyB64, outputDir, workers, func(e transfer.ProgressEvent) {
-		wailsruntime.EventsEmit(a.ctx, "transfer:progress", e)
-	})
-	if err != nil {
-		wailsruntime.EventsEmit(a.ctx, "transfer:error", map[string]string{"message": err.Error()})
-		return "", err
-	}
-	wailsruntime.EventsEmit(a.ctx, "transfer:complete", map[string]string{"path": outPath})
-	return outPath, nil
-}
-
 // ─── P2P direct transfer ──────────────────────────────────────────────────────
 
-// StartPeerSend opens a TCP listener, queries STUN for the public WAN address,
-// registers with the embedded relay rendezvous, and returns credentials immediately.
-// Transfer runs in a background goroutine.
+// StartPeerSend opens a TCP listener, maps the port via UPnP, and discovers
+// the WAN address via STUN. Returns credentials immediately so the sender can
+// share the link. Call StopPeerSend to cancel.
 func (a *App) StartPeerSend(filePath string, chunkMB int) (*transfer.PeerInfo, error) {
-	info, ps, err := a.peers.start(filePath, a.GetLocalServerURL(), chunkMB)
+	a.peers.stop()
+
+	ps, err := transfer.StartPeer(filePath, chunkMB)
 	if err != nil {
 		return nil, err
 	}
 
+	peerCtx, cancelPeer := context.WithCancel(a.ctx)
+	a.peers.set(ps, cancelPeer)
+
 	go func() {
-		err := ps.Serve(a.ctx, func(e transfer.ProgressEvent) {
+		progressFn := func(e transfer.ProgressEvent) {
 			wailsruntime.EventsEmit(a.ctx, "transfer:progress", e)
-		})
-		a.peers.compareAndClear(ps)
-		if err != nil {
+		}
+
+		err := ps.Serve(peerCtx, progressFn)
+		a.peers.clear(ps)
+		cancelPeer()
+
+		if err != nil && peerCtx.Err() == nil {
+			slog.Error("p2p: serve error", "err", err)
 			wailsruntime.EventsEmit(a.ctx, "transfer:error", map[string]string{"message": err.Error()})
-		} else {
+		} else if err == nil {
 			wailsruntime.EventsEmit(a.ctx, "transfer:complete", map[string]string{
 				"code": ps.Info.Code,
 				"key":  ps.Info.Key,
@@ -239,17 +132,18 @@ func (a *App) StartPeerSend(filePath string, chunkMB int) (*transfer.PeerInfo, e
 		}
 	}()
 
-	return info, nil
+	return ps.Info, nil
 }
 
-// StopPeerSend cancels waiting for a P2P receiver.
+// StopPeerSend cancels the active P2P send session.
 func (a *App) StopPeerSend() {
 	a.peers.stop()
 }
 
-// PeerReceive connects to a PeerServer (direct, hole-punch, or relay fallback).
-func (a *App) PeerReceive(peerAddr, code, keyB64, relayURL, outputDir string) (string, error) {
-	outPath, err := transfer.PeerReceive(a.ctx, peerAddr, code, keyB64, relayURL, outputDir, func(e transfer.ProgressEvent) {
+// PeerReceive connects to a PeerServer using the share link credentials,
+// downloads and decrypts the file to outputDir.
+func (a *App) PeerReceive(peerAddr, code, keyB64, outputDir string) (string, error) {
+	outPath, err := transfer.PeerReceive(a.ctx, peerAddr, code, keyB64, outputDir, func(e transfer.ProgressEvent) {
 		wailsruntime.EventsEmit(a.ctx, "transfer:progress", e)
 	})
 	if err != nil {
@@ -260,7 +154,9 @@ func (a *App) PeerReceive(peerAddr, code, keyB64, relayURL, outputDir string) (s
 	return outPath, nil
 }
 
-// GenerateQRCode returns a data:image/png;base64 string for the given content.
+// ─── Utilities ────────────────────────────────────────────────────────────────
+
+// GenerateQRCode returns a data:image/png;base64 URI for the given content.
 func (a *App) GenerateQRCode(content string) (string, error) {
 	png, err := qrcode.Encode(content, qrcode.Medium, 200)
 	if err != nil {
@@ -269,7 +165,7 @@ func (a *App) GenerateQRCode(content string) (string, error) {
 	return "data:image/png;base64," + base64.StdEncoding.EncodeToString(png), nil
 }
 
-// FormatBytes formats bytes as human-readable string.
+// FormatBytes formats bytes as human-readable string (e.g. "1.5 GB").
 func (a *App) FormatBytes(b int64) string {
 	if b < 1024 {
 		return fmt.Sprintf("%d B", b)

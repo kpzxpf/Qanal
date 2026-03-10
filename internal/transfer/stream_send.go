@@ -23,6 +23,29 @@ import (
 func StreamSend(ctx context.Context, serverURL, filePath string, chunkMB int,
 	onReady func(code, key string), progress ProgressFn) error {
 
+	keyBytes := make([]byte, 32)
+	if _, err := rand.Read(keyBytes); err != nil {
+		return fmt.Errorf("generate key: %w", err)
+	}
+
+	codeSrc := make([]byte, 5)
+	if _, err := rand.Read(codeSrc); err != nil {
+		return fmt.Errorf("generate code: %w", err)
+	}
+	code := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(codeSrc)[:8]
+
+	onReady(code, base64.RawURLEncoding.EncodeToString(keyBytes))
+	return StreamSendWith(ctx, serverURL, filePath, code, keyBytes, chunkMB, progress)
+}
+
+// StreamSendWith is like StreamSend but uses pre-generated code and keyBytes
+// instead of generating new ones. Use this when multiple transport paths
+// (e.g., P2P TCP and relay streaming) share the same session credentials.
+func StreamSendWith(ctx context.Context, serverURL, filePath, code string, keyBytes []byte, chunkMB int, progress ProgressFn) error {
+	if len(keyBytes) != 32 {
+		return fmt.Errorf("key must be 32 bytes, got %d", len(keyBytes))
+	}
+
 	f, stat, err := openFileInfo(filePath)
 	if err != nil {
 		return err
@@ -37,18 +60,6 @@ func StreamSend(ctx context.Context, serverURL, filePath string, chunkMB int,
 		return fmt.Errorf("hash file: %w", err)
 	}
 
-	keyBytes := make([]byte, 32)
-	if _, err := rand.Read(keyBytes); err != nil {
-		return fmt.Errorf("generate key: %w", err)
-	}
-	keyB64 := base64.RawURLEncoding.EncodeToString(keyBytes)
-
-	codeSrc := make([]byte, 5)
-	if _, err := rand.Read(codeSrc); err != nil {
-		return fmt.Errorf("generate code: %w", err)
-	}
-	code := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(codeSrc)[:8]
-
 	if chunkMB <= 0 {
 		chunkMB = 16
 	}
@@ -57,9 +68,6 @@ func StreamSend(ctx context.Context, serverURL, filePath string, chunkMB int,
 	if totalChunks == 0 {
 		totalChunks = 1
 	}
-
-	// Announce credentials to the caller before the receiver connects.
-	onReady(code, keyB64)
 
 	// pr/pw connect the encryption pipeline to the HTTP request body.
 	pr, pw := io.Pipe()

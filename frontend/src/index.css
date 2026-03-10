@@ -5,7 +5,7 @@ input, textarea { -webkit-user-select: text; user-select: text; }
 
 body {
   font-family: 'Inter', 'Segoe UI', system-ui, -apple-system, sans-serif;
-  background: #0d0f14;
+  background: #0c0f16;
   color: #e4e7f0;
   height: 100vh;
   overflow: hidden;
@@ -19,8 +19,8 @@ body {
 /* Custom scrollbar */
 ::-webkit-scrollbar { width: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: #2a2f42; border-radius: 3px; }
-::-webkit-scrollbar-thumb:hover { background: #3a3f55; }
+::-webkit-scrollbar-thumb { background: #2e3550; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #3d4566; }
 
 /* Smooth transitions */
 * { transition-property: color, background-color, border-color, opacity, transform;

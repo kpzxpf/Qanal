@@ -22,12 +22,10 @@ function fileIcon(name: string) {
   return '📄'
 }
 
-export default function SendPanel({ defaultServerURL }: { defaultServerURL: string }) {
-  const [serverURL, setServerURL] = useState(defaultServerURL)
+export default function SendPanel() {
   const [filePath, setFilePath] = useState('')
   const [fileInfo, setFileInfo] = useState<transfer.FileInfo | null>(null)
   const [chunkMB, setChunkMB] = useState(16)
-  const [workers, setWorkers] = useState(8)
   const [phase, setPhase] = useState<Phase>('idle')
   const [progress, setProgress] = useState<Progress | null>(null)
   const [peerInfo, setPeerInfo] = useState<transfer.PeerInfo | null>(null)
@@ -36,11 +34,6 @@ export default function SendPanel({ defaultServerURL }: { defaultServerURL: stri
   const [isDragging, setIsDragging] = useState(false)
   const [showAdvanced, setShowAdvanced] = useState(false)
   const autoCopied = useRef(false)
-
-  useEffect(() => {
-    if (serverURL === 'http://localhost:8080' && defaultServerURL !== 'http://localhost:8080')
-      setServerURL(defaultServerURL)
-  }, [defaultServerURL])
 
   // Wails OS file drop
   useEffect(() => {
@@ -71,7 +64,11 @@ export default function SendPanel({ defaultServerURL }: { defaultServerURL: stri
     document.addEventListener('dragover', onOver)
     document.addEventListener('dragleave', onLeave)
     document.addEventListener('drop', onDrop)
-    return () => { document.removeEventListener('dragover', onOver); document.removeEventListener('dragleave', onLeave); document.removeEventListener('drop', onDrop) }
+    return () => {
+      document.removeEventListener('dragover', onOver)
+      document.removeEventListener('dragleave', onLeave)
+      document.removeEventListener('drop', onDrop)
+    }
   }, [])
 
   const reset = useCallback(() => {
@@ -114,7 +111,7 @@ export default function SendPanel({ defaultServerURL }: { defaultServerURL: stri
       const info = await StartPeerSend(filePath, chunkMB)
       setPeerInfo(info)
       setPhase('waiting')
-      const link = encodeLink({ t: 'p', w: info.wan, l: info.lan, c: info.code, k: info.key, r: info.relay })
+      const link = encodeLink({ t: 'p', w: info.wan, l: info.lan, c: info.code, k: info.key })
       if (!autoCopied.current) { autoCopied.current = true; copyLink(link) }
     } catch (e: any) {
       setError(e?.message || String(e)); setPhase('error')
@@ -128,19 +125,19 @@ export default function SendPanel({ defaultServerURL }: { defaultServerURL: stri
   }, [reset])
 
   const pct = progress ? Math.round((progress.done / progress.total) * 100) : 0
-  const p2pLink = peerInfo ? encodeLink({ t: 'p', w: peerInfo.wan, l: peerInfo.lan, c: peerInfo.code, k: peerInfo.key, r: peerInfo.relay }) : ''
+  const p2pLink = peerInfo ? encodeLink({ t: 'p', w: peerInfo.wan, l: peerInfo.lan, c: peerInfo.code, k: peerInfo.key }) : ''
 
-  // ── Starting spinner ────────────────────────────────────────────────────────
+  // ── Starting spinner ─────────────────────────────────────────────────────────
   if (phase === 'starting') {
     return (
       <div className="flex flex-col items-center justify-center py-24 gap-4">
         <div className="w-10 h-10 border-2 border-[#5b7cfa]/20 border-t-[#5b7cfa] rounded-full animate-spin" />
-        <p className="text-[#4a5068] text-sm">Подготовка…</p>
+        <p className="text-[#5a6280] text-sm">Открытие порта…</p>
       </div>
     )
   }
 
-  // ── P2P waiting / transferring ──────────────────────────────────────────────
+  // ── Waiting / transferring ───────────────────────────────────────────────────
   if ((phase === 'waiting' || phase === 'transferring') && peerInfo) {
     return (
       <div className="space-y-3">
@@ -155,21 +152,37 @@ export default function SendPanel({ defaultServerURL }: { defaultServerURL: stri
           )}
         </div>
 
-        {/* File chip */}
+        {/* CGNAT warning */}
+        {peerInfo.cgnat && (
+          <div className="bg-amber-500/8 border border-amber-500/25 rounded-xl px-4 py-3 text-xs text-amber-400 space-y-1">
+            <div className="font-semibold">⚠ CGNAT обнаружен — передача через интернет заблокирована</div>
+            <div className="text-amber-400/70">
+              Ваш провайдер использует двойной NAT. Используйте <span className="font-semibold">LAN-адрес</span> (одна сеть) или попросите провайдера выдать белый IP.
+            </div>
+          </div>
+        )}
+
+        {/* UPnP status */}
+        {!peerInfo.cgnat && !peerInfo.upnp && peerInfo.wan && (
+          <div className="bg-blue-500/8 border border-blue-500/20 rounded-xl px-4 py-3 text-xs text-blue-400">
+            ℹ UPnP недоступен — если получатель в другой сети, порт нужно открыть вручную в роутере.
+          </div>
+        )}
+
         {fileInfo && <FileChip info={fileInfo} />}
-
-        {/* Share link */}
         <ShareBox link={p2pLink} copied={copied} onCopy={() => copyLink(p2pLink)} />
-
-        {/* Progress bar */}
         {phase === 'transferring' && progress && <ProgressCard progress={progress} pct={pct} />}
 
         {/* Connection details */}
-        <div className="bg-[#0f1117] border border-[#1e2235] rounded-xl p-4 space-y-2">
-          <p className="text-xs text-[#4a5068] uppercase tracking-widest font-semibold mb-3">Детали подключения</p>
+        <div className="bg-[#111520] border border-[#242a3c] rounded-xl p-4 space-y-2">
+          <p className="text-xs text-[#5a6280] uppercase tracking-widest font-semibold mb-3">Детали подключения</p>
           {peerInfo.wan && <AddrRow label="Интернет" value={peerInfo.wan} accent="text-[#34d399]" />}
           <AddrRow label="LAN" value={peerInfo.lan} accent="text-[#5b7cfa]" />
           <AddrRow label="Код" value={peerInfo.code} accent="text-[#a78bfa]" />
+          <div className="flex gap-3 pt-1">
+            <Badge label="UPnP" ok={peerInfo.upnp} />
+            <Badge label="CGNAT" ok={!peerInfo.cgnat} invert />
+          </div>
         </div>
 
         <CancelBtn onClick={cancel} />
@@ -177,23 +190,17 @@ export default function SendPanel({ defaultServerURL }: { defaultServerURL: stri
     )
   }
 
-
-  // ── Done P2P ────────────────────────────────────────────────────────────────
+  // ── Done ─────────────────────────────────────────────────────────────────────
   if (phase === 'done') {
     return (
       <div className="space-y-3">
-        <DoneCard
-          title="Файл передан"
-          bytes={progress?.totalBytes}
-          speed={progress?.speedBps}
-        />
+        <DoneCard title="Файл передан" bytes={progress?.totalBytes} speed={progress?.speedBps} />
         <ResetBtn onClick={reset} label="Отправить ещё" />
       </div>
     )
   }
 
-
-  // ── Idle / error ────────────────────────────────────────────────────────────
+  // ── Idle / error ─────────────────────────────────────────────────────────────
   return (
     <div className="space-y-3">
       {/* Drop zone */}
@@ -203,8 +210,8 @@ export default function SendPanel({ defaultServerURL }: { defaultServerURL: stri
           isDragging
             ? 'border-[#5b7cfa] bg-[#5b7cfa]/5 shadow-lg shadow-[#5b7cfa]/10'
             : fileInfo
-              ? 'border-[#1e2235] bg-[#0f1117]'
-              : 'border-dashed border-[#1e2235] bg-[#0f1117] hover:border-[#2a3050] cursor-pointer'
+              ? 'border-[#242a3c] bg-[#111520]'
+              : 'border-dashed border-[#242a3c] bg-[#111520] hover:border-[#2a3050] cursor-pointer'
         }`}
       >
         {fileInfo ? (
@@ -212,59 +219,54 @@ export default function SendPanel({ defaultServerURL }: { defaultServerURL: stri
             <span className="text-2xl">{fileIcon(fileInfo.name)}</span>
             <div className="flex-1 min-w-0">
               <div className="font-semibold text-sm truncate">{fileInfo.name}</div>
-              <div className="text-xs text-[#4a5068] mt-0.5">{fmt(fileInfo.size)}</div>
+              <div className="text-xs text-[#5a6280] mt-0.5">{fmt(fileInfo.size)}</div>
             </div>
             <button onClick={pickFile}
-              className="shrink-0 text-xs text-[#4a5068] hover:text-[#8b92a8] border border-[#1e2235] hover:border-[#2a3050] px-3 py-1.5 rounded-lg transition-all">
+              className="shrink-0 text-xs text-[#5a6280] hover:text-[#8b92a8] border border-[#242a3c] hover:border-[#2a3050] px-3 py-1.5 rounded-lg transition-all">
               Изменить
             </button>
           </div>
         ) : (
           <div className="py-14 flex flex-col items-center gap-2">
             <span className={`text-4xl transition-all ${isDragging ? 'scale-110' : 'opacity-30'}`}>📂</span>
-            <span className="text-sm text-[#4a5068]">
+            <span className="text-sm text-[#5a6280]">
               {isDragging ? 'Отпустите файл' : 'Нажмите или перетащите файл'}
             </span>
-            <span className="text-xs text-[#2a3050]">Любой формат · До 100 ГБ</span>
+            <span className="text-xs text-[#3d4562]">Любой формат · До 100 ГБ</span>
           </div>
         )}
       </div>
 
-      {/* Error */}
       {phase === 'error' && error && (
         <div className="bg-red-500/8 border border-red-500/20 text-red-400 rounded-xl px-4 py-3 text-sm">{error}</div>
       )}
 
-      {/* Advanced */}
+      {/* Advanced options */}
       <div>
         <button onClick={() => setShowAdvanced(v => !v)}
-          className="flex items-center gap-1.5 text-xs text-[#2a3050] hover:text-[#4a5068] transition-colors px-1 py-0.5">
+          className="flex items-center gap-1.5 text-xs text-[#3d4562] hover:text-[#5a6280] transition-colors px-1 py-0.5">
           <span className={`transition-transform ${showAdvanced ? 'rotate-90' : ''}`}>▶</span>
           Дополнительно
         </button>
         {showAdvanced && (
-          <div className="mt-2 bg-[#0f1117] border border-[#1e2235] rounded-xl p-4 space-y-3">
-            <div>
-              <label className="block text-xs text-[#4a5068] mb-1.5">Размер чанка</label>
-              <select value={chunkMB} onChange={e => setChunkMB(Number(e.target.value))}
-                className="w-full bg-[#0a0c10] border border-[#1e2235] rounded-lg px-3 py-2 text-xs text-[#8b92a8] outline-none">
-                <option value={0}>Авто (RTT)</option>
-                <option value={8}>8 МБ</option>
-                <option value={16}>16 МБ</option>
-                <option value={32}>32 МБ</option>
-                <option value={64}>64 МБ</option>
-              </select>
-            </div>
+          <div className="mt-2 bg-[#111520] border border-[#242a3c] rounded-xl p-4">
+            <label className="block text-xs text-[#5a6280] mb-1.5">Размер чанка</label>
+            <select value={chunkMB} onChange={e => setChunkMB(Number(e.target.value))}
+              className="w-full bg-[#0c0f16] border border-[#242a3c] rounded-lg px-3 py-2 text-xs text-[#8b92a8] outline-none">
+              <option value={8}>8 МБ</option>
+              <option value={16}>16 МБ (по умолчанию)</option>
+              <option value={32}>32 МБ</option>
+              <option value={64}>64 МБ</option>
+            </select>
           </div>
         )}
       </div>
 
-      {/* Start button */}
       <button onClick={startTransfer} disabled={!fileInfo}
         className={`w-full py-3.5 rounded-xl font-bold text-sm transition-all ${
           fileInfo
             ? 'bg-gradient-to-r from-[#5b7cfa] to-[#a78bfa] text-white hover:opacity-90 hover:-translate-y-0.5 shadow-lg shadow-[#5b7cfa]/20'
-            : 'bg-[#0f1117] text-[#2a3050] border border-[#1e2235] cursor-not-allowed'
+            : 'bg-[#111520] text-[#3d4562] border border-[#242a3c] cursor-not-allowed'
         }`}>
         ⚡ Начать — строка скопируется автоматически
       </button>
@@ -277,13 +279,12 @@ export default function SendPanel({ defaultServerURL }: { defaultServerURL: stri
 function FileChip({ info }: { info: { name: string; size: number } }) {
   const ext = info.name.split('.').pop()?.toLowerCase() ?? ''
   const icons: Record<string, string> = { jpg:'🖼', jpeg:'🖼', png:'🖼', mp4:'🎬', mp3:'🎵', zip:'📦', pdf:'📑' }
-  const icon = icons[ext] ?? '📄'
   return (
-    <div className="flex items-center gap-3 bg-[#0f1117] border border-[#1e2235] rounded-xl px-4 py-3">
-      <span className="text-xl">{icon}</span>
+    <div className="flex items-center gap-3 bg-[#111520] border border-[#242a3c] rounded-xl px-4 py-3">
+      <span className="text-xl">{icons[ext] ?? '📄'}</span>
       <div className="flex-1 min-w-0">
         <div className="font-semibold text-sm truncate">{info.name}</div>
-        <div className="text-xs text-[#4a5068]">{fmt(info.size)}</div>
+        <div className="text-xs text-[#5a6280]">{fmt(info.size)}</div>
       </div>
     </div>
   )
@@ -291,16 +292,16 @@ function FileChip({ info }: { info: { name: string; size: number } }) {
 
 function ShareBox({ link, copied, onCopy }: { link: string; copied: boolean; onCopy: () => void }) {
   return (
-    <div className="bg-[#0f1117] border border-[#1e2235] rounded-xl overflow-hidden">
+    <div className="bg-[#111520] border border-[#242a3c] rounded-xl overflow-hidden">
       <div className="px-4 pt-3 pb-2">
-        <p className="text-xs text-[#4a5068] uppercase tracking-widest font-semibold mb-2">Строка для получателя</p>
+        <p className="text-xs text-[#5a6280] uppercase tracking-widest font-semibold mb-2">Строка для получателя</p>
         <p className="font-mono text-xs text-[#8b92a8] break-all leading-relaxed select-all">{link}</p>
       </div>
       <button onClick={onCopy}
         className={`w-full py-2.5 text-sm font-semibold transition-all border-t ${
           copied
             ? 'bg-[#34d399]/10 border-[#34d399]/20 text-[#34d399]'
-            : 'bg-[#161920] border-[#1e2235] text-[#8b92a8] hover:text-white hover:bg-[#1e2235]'
+            : 'bg-[#161920] border-[#242a3c] text-[#8b92a8] hover:text-white hover:bg-[#1e2235]'
         }`}>
         {copied ? '✓ Скопировано' : '📋 Скопировать'}
       </button>
@@ -312,14 +313,12 @@ function ProgressCard({ progress, pct }: { progress: Progress; pct: number }) {
   const remaining = progress.totalBytes - progress.bytesDone
   const eta = progress.speedBps > 0 && remaining > 0 ? remaining / progress.speedBps : 0
   return (
-    <div className="bg-[#0f1117] border border-[#1e2235] rounded-xl p-4 space-y-2.5">
+    <div className="bg-[#111520] border border-[#242a3c] rounded-xl p-4 space-y-2.5">
       <div className="h-1.5 bg-[#1e2235] rounded-full overflow-hidden">
-        <div
-          className="h-full bg-gradient-to-r from-[#5b7cfa] to-[#a78bfa] rounded-full transition-all duration-300"
-          style={{ width: `${pct}%` }}
-        />
+        <div className="h-full bg-gradient-to-r from-[#5b7cfa] to-[#a78bfa] rounded-full transition-all duration-300"
+          style={{ width: `${pct}%` }} />
       </div>
-      <div className="flex items-center justify-between text-xs text-[#4a5068]">
+      <div className="flex items-center justify-between text-xs text-[#5a6280]">
         <span>{fmt(progress.bytesDone)} / {fmt(progress.totalBytes)}</span>
         <div className="flex items-center gap-3">
           {progress.speedBps > 0 && <span className="text-[#34d399] font-bold">{fmt(progress.speedBps)}/с</span>}
@@ -330,14 +329,13 @@ function ProgressCard({ progress, pct }: { progress: Progress; pct: number }) {
   )
 }
 
-function DoneCard({ title, subtitle, bytes, speed }: { title: string; subtitle?: string; bytes?: number; speed?: number }) {
+function DoneCard({ title, bytes, speed }: { title: string; bytes?: number; speed?: number }) {
   return (
-    <div className="bg-[#0f1117] border border-[#34d399]/20 rounded-xl p-5 text-center space-y-1">
+    <div className="bg-[#111520] border border-[#34d399]/20 rounded-xl p-5 text-center space-y-1">
       <div className="text-2xl mb-2">✅</div>
       <div className="font-bold text-[#34d399]">{title}</div>
-      {subtitle && <div className="text-xs text-[#4a5068]">{subtitle}</div>}
       {bytes != null && (
-        <div className="text-xs text-[#4a5068] mt-1">
+        <div className="text-xs text-[#5a6280] mt-1">
           {fmt(bytes)}
           {speed && speed > 0 && <span className="ml-2 text-[#34d399] font-semibold">{fmt(speed)}/с</span>}
         </div>
@@ -350,21 +348,34 @@ function AddrRow({ label, value, accent }: { label: string; value: string; accen
   const [c, setC] = useState(false)
   return (
     <div className="flex items-center gap-2">
-      <span className="text-xs text-[#2a3050] w-14 shrink-0">{label}</span>
+      <span className="text-xs text-[#3d4562] w-14 shrink-0">{label}</span>
       <span className={`font-mono text-xs flex-1 truncate ${accent}`}>{value}</span>
       <button
         onClick={() => { navigator.clipboard.writeText(value); setC(true); setTimeout(() => setC(false), 1500) }}
-        className="shrink-0 text-xs px-2 py-0.5 border border-[#1e2235] rounded text-[#4a5068] hover:text-[#8b92a8] transition-colors">
+        className="shrink-0 text-xs px-2 py-0.5 border border-[#242a3c] rounded text-[#5a6280] hover:text-[#8b92a8] transition-colors">
         {c ? '✓' : '📋'}
       </button>
     </div>
   )
 }
 
+function Badge({ label, ok, invert }: { label: string; ok: boolean; invert?: boolean }) {
+  const active = invert ? !ok : ok
+  return (
+    <span className={`text-xs px-2 py-0.5 rounded-full border ${
+      active
+        ? 'border-[#34d399]/30 text-[#34d399] bg-[#34d399]/5'
+        : 'border-[#242a3c] text-[#3d4562]'
+    }`}>
+      {ok !== (invert ?? false) ? '✓' : '✗'} {label}
+    </span>
+  )
+}
+
 function CancelBtn({ onClick }: { onClick: () => void }) {
   return (
     <button onClick={onClick}
-      className="w-full py-2.5 rounded-xl text-xs text-[#4a5068] border border-[#1e2235] hover:border-red-500/30 hover:text-red-400 transition-all">
+      className="w-full py-2.5 rounded-xl text-xs text-[#5a6280] border border-[#242a3c] hover:border-red-500/30 hover:text-red-400 transition-all">
       Отменить
     </button>
   )
@@ -373,7 +384,7 @@ function CancelBtn({ onClick }: { onClick: () => void }) {
 function ResetBtn({ onClick, label }: { onClick: () => void; label: string }) {
   return (
     <button onClick={onClick}
-      className="w-full py-3 rounded-xl text-sm font-semibold text-[#4a5068] border border-[#1e2235] hover:border-[#5b7cfa]/40 hover:text-[#8b92a8] transition-all">
+      className="w-full py-3 rounded-xl text-sm font-semibold text-[#5a6280] border border-[#242a3c] hover:border-[#5b7cfa]/40 hover:text-[#8b92a8] transition-all">
       {label}
     </button>
   )

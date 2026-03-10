@@ -14,16 +14,8 @@ export function GetFileInfo(arg1) {
   return window['go']['main']['App']['GetFileInfo'](arg1);
 }
 
-export function GetLocalServerURL() {
-  return window['go']['main']['App']['GetLocalServerURL']();
-}
-
-export function PeerReceive(arg1, arg2, arg3, arg4, arg5) {
-  return window['go']['main']['App']['PeerReceive'](arg1, arg2, arg3, arg4, arg5);
-}
-
-export function ReceiveFile(arg1, arg2, arg3, arg4, arg5) {
-  return window['go']['main']['App']['ReceiveFile'](arg1, arg2, arg3, arg4, arg5);
+export function PeerReceive(arg1, arg2, arg3, arg4) {
+  return window['go']['main']['App']['PeerReceive'](arg1, arg2, arg3, arg4);
 }
 
 export function SelectDirectory() {
@@ -32,10 +24,6 @@ export function SelectDirectory() {
 
 export function SelectFile() {
   return window['go']['main']['App']['SelectFile']();
-}
-
-export function SendFile(arg1, arg2, arg3, arg4) {
-  return window['go']['main']['App']['SendFile'](arg1, arg2, arg3, arg4);
 }
 
 export function StartPeerSend(arg1, arg2) {

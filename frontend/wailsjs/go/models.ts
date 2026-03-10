@@ -21,7 +21,8 @@ export namespace transfer {
 	    wan: string;
 	    code: string;
 	    key: string;
-	    relay: string;
+	    upnp: boolean;
+	    cgnat: boolean;
 	
 	    static createFrom(source: any = {}) {
 	        return new PeerInfo(source);
@@ -33,23 +34,8 @@ export namespace transfer {
 	        this.wan = source["wan"];
 	        this.code = source["code"];
 	        this.key = source["key"];
-	        this.relay = source["relay"];
-	    }
-	}
-	export class SendResult {
-	    code: string;
-	    key: string;
-	    fileHash?: string;
-	
-	    static createFrom(source: any = {}) {
-	        return new SendResult(source);
-	    }
-	
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.code = source["code"];
-	        this.key = source["key"];
-	        this.fileHash = source["fileHash"];
+	        this.upnp = source["upnp"];
+	        this.cgnat = source["cgnat"];
 	    }
 	}
 

@@ -28,16 +28,54 @@ func GetFileInfo(path string) (*FileInfo, error) {
 	}, nil
 }
 
-// GetLocalIP returns the first non-loopback IPv4 address of this machine.
+// GetLocalIP returns the best non-loopback IPv4 address for this machine.
+// It prefers common LAN ranges (192.168.x.x, 10.x.x.x) over virtual/Docker
+// bridge ranges (172.16-31.x.x) to avoid picking Docker adapter addresses.
 func GetLocalIP() string {
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
 		return "127.0.0.1"
 	}
+
+	var (
+		home      string // 192.168.x.x
+		private10 string // 10.x.x.x
+		other     string // 172.16-31.x.x or anything else non-loopback
+	)
+
 	for _, addr := range addrs {
-		if ipNet, ok := addr.(*net.IPNet); ok && !ipNet.IP.IsLoopback() && ipNet.IP.To4() != nil {
-			return ipNet.IP.String()
+		ipNet, ok := addr.(*net.IPNet)
+		if !ok || ipNet.IP.IsLoopback() || ipNet.IP.IsLinkLocalUnicast() {
+			continue
 		}
+		ip4 := ipNet.IP.To4()
+		if ip4 == nil {
+			continue
+		}
+		switch {
+		case ip4[0] == 192 && ip4[1] == 168:
+			if home == "" {
+				home = ip4.String()
+			}
+		case ip4[0] == 10:
+			if private10 == "" {
+				private10 = ip4.String()
+			}
+		default:
+			if other == "" {
+				other = ip4.String()
+			}
+		}
+	}
+
+	if home != "" {
+		return home
+	}
+	if private10 != "" {
+		return private10
+	}
+	if other != "" {
+		return other
 	}
 	return "127.0.0.1"
 }

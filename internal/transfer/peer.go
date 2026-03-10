@@ -2,7 +2,6 @@ package transfer
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base32"
@@ -13,23 +12,30 @@ import (
 	"io"
 	"log/slog"
 	"net"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
-// PeerInfo is shown to the sender so they can share it with the recipient.
+// tcpBufSize — TCP socket buffer for high-throughput transfers (8 MiB).
+const tcpBufSize = 8 * 1024 * 1024
+
+// maxFrameLen — maximum allowed encrypted chunk size (sanity guard).
+const maxFrameLen = 256 * 1024 * 1024 // 256 MiB
+
+// PeerInfo holds connection details shared with the receiver via the share link.
 type PeerInfo struct {
-	LAN   string `json:"lan"`   // local-network address: 192.168.x.x:PORT
-	WAN   string `json:"wan"`   // internet address: x.x.x.x:PORT (empty if STUN failed)
-	Code  string `json:"code"`  // 8-char session auth token
-	Key   string `json:"key"`   // base64url AES-256 key
-	Relay string `json:"relay"` // embedded relay URL for signaling + fallback
+	LAN   string `json:"lan"`
+	WAN   string `json:"wan"` // public IP:port; empty if unreachable
+	Code  string `json:"code"`
+	Key   string `json:"key"`
+	Upnp  bool   `json:"upnp"`  // UPnP port mapping succeeded
+	Cgnat bool   `json:"cgnat"` // ISP CGNAT detected; WAN transfer blocked
 }
 
-// PeerServer is the sender-side TCP listener for direct P2P transfers.
+// PeerServer is the sender-side TCP listener.
 type PeerServer struct {
 	listener net.Listener
 	filePath string
@@ -38,12 +44,50 @@ type PeerServer struct {
 	Info     *PeerInfo
 }
 
-// StartPeer creates a TCP listener on a random port, queries STUN servers to
-// discover the public WAN address, registers with the relay rendezvous for
-// signaling, and returns credentials immediately.
-// relayURL is the embedded relay (e.g. http://192.168.1.5:8080).
-// Call Serve() in a goroutine to wait for and handle the receiver connection.
-func StartPeer(filePath, relayURL string, chunkMB int) (*PeerServer, error) {
+// metaMsg is the file metadata sent from sender to receiver after successful auth.
+type metaMsg struct {
+	FileName    string `json:"f"`
+	FileSize    int64  `json:"s"`
+	TotalChunks int    `json:"n"`
+	ChunkSize   int64  `json:"c"`
+}
+
+// writeLenFrame sends [4-byte BE length][data] over conn in one syscall.
+func writeLenFrame(conn net.Conn, data []byte) error {
+	pkt := make([]byte, 4+len(data))
+	binary.BigEndian.PutUint32(pkt, uint32(len(data)))
+	copy(pkt[4:], data)
+	_, err := conn.Write(pkt)
+	return err
+}
+
+// readLenFrame reads [4-byte BE length][data] from r.
+func readLenFrame(r io.Reader) ([]byte, error) {
+	var hdr [4]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return nil, err
+	}
+	n := binary.BigEndian.Uint32(hdr[:])
+	if n == 0 || n > maxFrameLen {
+		return nil, fmt.Errorf("invalid frame length: %d", n)
+	}
+	data := make([]byte, n)
+	if _, err := io.ReadFull(r, data); err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+// StartPeer opens a TCP listener, maps the port via UPnP, and discovers the
+// public IP via STUN. Returns immediately; call Serve to handle a transfer.
+//
+// WAN address strategy:
+//   - UPnP maps TCP port X → external IP:X (router forwards to us).
+//     ExternalPort = localPort by design, so wanAddr port = localPort always.
+//   - STUN discovers the true public IP (may differ from UPnP router IP under CGNAT).
+//   - If UPnP succeeded: wanAddr = stunIP:port (or upnpIP:port if STUN failed).
+//   - CGNAT = upnpIP ≠ stunIP (ISP has another NAT layer; UPnP mapping useless).
+func StartPeer(filePath string, chunkMB int) (*PeerServer, error) {
 	key := make([]byte, 32)
 	if _, err := rand.Read(key); err != nil {
 		return nil, fmt.Errorf("generate key: %w", err)
@@ -59,23 +103,95 @@ func StartPeer(filePath, relayURL string, chunkMB int) (*PeerServer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listen: %w", err)
 	}
-
 	port := ln.Addr().(*net.TCPAddr).Port
 
-	// STUN: discover external IP:port (blocks up to 3 s — acceptable at session start).
-	wanAddr, _ := DiscoverWANAddr(port) // empty on failure; not fatal
+	// UPnP and STUN run concurrently; wait up to 6 s for both.
+	type wanResult struct{ ip, via string }
+	ch := make(chan wanResult, 2)
+
+	go func() {
+		ip, err := MapUPnPPort(port)
+		if err != nil {
+			slog.Debug("UPnP unavailable", "err", err)
+			ch <- wanResult{"", "upnp"}
+			return
+		}
+		ch <- wanResult{ip, "upnp"}
+	}()
+	go func() {
+		addr, err := DiscoverWANAddr(port)
+		if err != nil {
+			slog.Debug("STUN unavailable", "err", err)
+			ch <- wanResult{"", "stun"}
+			return
+		}
+		// DiscoverWANAddr returns "stunIP:stunPort" (UDP port).
+		// Extract only the IP; the correct TCP port is always our listener port.
+		host, _, parseErr := net.SplitHostPort(addr)
+		if parseErr != nil {
+			host = addr
+		}
+		ch <- wanResult{host, "stun"}
+	}()
+
+	var upnpIP, stunIP string
+	timer := time.NewTimer(6 * time.Second)
+	defer timer.Stop()
+	for got := 0; got < 2; {
+		select {
+		case r := <-ch:
+			got++
+			switch r.via {
+			case "upnp":
+				upnpIP = r.ip
+			case "stun":
+				stunIP = r.ip
+			}
+		case <-timer.C:
+			got = 2
+		}
+	}
+
+	// Choose WAN address.
+	//
+	// The UPnP mapping guarantees that TCP connections to externalIP:port reach us,
+	// where externalIP = upnpIP. STUN tells us the true public IP so we can detect
+	// CGNAT (ISP has another NAT; our UPnP mapping on the home router is useless).
+	//
+	// Best address to put in the share link:
+	//   • UPnP + no CGNAT → upnpIP:port (port forwarded, receiver can reach us)
+	//   • UPnP + CGNAT     → stunIP:port  (flag CGNAT warning; port NOT reachable)
+	//   • Only STUN        → stunIP:port  (no port mapping; may work on public IPs)
+	//   • Neither          → empty (WAN unavailable)
+	var wanAddr string
+	upnpOK := upnpIP != ""
+	var cgnat bool
+
+	if upnpOK {
+		if stunIP != "" && stunIP != upnpIP {
+			// Router's external IP ≠ true public IP → CGNAT detected.
+			cgnat = true
+			slog.Warn("CGNAT detected: internet P2P will not work",
+				"router_ip", upnpIP, "public_ip", stunIP)
+			// Still populate WAN for UI; receiver will see the warning.
+			wanAddr = fmt.Sprintf("%s:%d", stunIP, port)
+		} else {
+			// No CGNAT: use UPnP router IP (STUN IP same or unavailable).
+			wanAddr = fmt.Sprintf("%s:%d", upnpIP, port)
+		}
+	} else if stunIP != "" {
+		// UPnP unavailable but we have a public IP (direct internet connection?).
+		wanAddr = fmt.Sprintf("%s:%d", stunIP, port)
+		slog.Info("UPnP unavailable, using STUN IP for WAN; port NOT forwarded", "addr", wanAddr)
+	}
 
 	info := &PeerInfo{
 		LAN:   fmt.Sprintf("%s:%d", GetLocalIP(), port),
 		WAN:   wanAddr,
 		Code:  code,
 		Key:   base64.RawURLEncoding.EncodeToString(key),
-		Relay: relayURL,
-	}
-
-	// Register with rendezvous so the receiver can find us and trigger hole punch.
-	if relayURL != "" {
-		go registerWithRendezvous(relayURL, code, wanAddr, info.LAN)
+		Upnp:  upnpOK,
+		Cgnat: cgnat,
 	}
 
 	return &PeerServer{
@@ -87,74 +203,74 @@ func StartPeer(filePath, relayURL string, chunkMB int) (*PeerServer, error) {
 	}, nil
 }
 
-// registerWithRendezvous POST-s sender info to the relay so the receiver can
-// find us for signaling. Fire-and-forget; errors are non-fatal.
-func registerWithRendezvous(relayURL, code, wan, lan string) {
-	body := jsonMarshal(map[string]string{"code": code, "wan": wan, "lan": lan})
-	post(relayURL+"/api/v1/p2p/register", body)
+// Close stops the peer server.
+func (s *PeerServer) Close() {
+	s.listener.Close()
 }
 
-// pipeChunk carries one encrypted chunk through the pipeline goroutine.
-type pipeChunk struct {
-	data     []byte
-	plainLen int64
-	err      error
-}
-
-// Serve waits for the receiver connection — either via direct Accept() or via
-// hole-punch outbound connect — then streams the file directly.
-// Times out after 10 minutes if no receiver connects.
-// Cancelling ctx interrupts the Accept() wait and any active transmission.
+// Serve handles exactly one receiver.
+//
+// Protocol:
+//
+//	Receiver → Sender : [8 bytes auth code]
+//	Sender   → Receiver: [4-byte len]["ERR:xxx"] on failure  OR
+//	                     [4-byte len][JSON metadata] on success
+//	Data loop (sender → receiver):
+//	  [4-byte encLen][AES-256-GCM encrypted chunk] × totalChunks
+//
+// Chunks are pipelined: goroutine encrypts chunk N+1 while the main
+// goroutine sends chunk N, keeping both CPU and network busy.
 func (s *PeerServer) Serve(ctx context.Context, progress ProgressFn) error {
-	listenerDone := make(chan struct{})
-	defer close(listenerDone)
+	// Close listener when context is cancelled so Accept() unblocks.
+	stop := make(chan struct{})
+	defer close(stop)
 	go func() {
 		select {
 		case <-ctx.Done():
 			s.listener.Close()
-		case <-listenerDone:
+		case <-stop:
 		}
 	}()
-	defer s.listener.Close()
 
-	s.listener.(*net.TCPListener).SetDeadline(time.Now().Add(10 * time.Minute))
+	_ = s.listener.(*net.TCPListener).SetDeadline(time.Now().Add(15 * time.Minute))
 
-	// If we have a relay URL, concurrently watch for receiver via rendezvous
-	// and then punch toward them. This creates a NAT mapping on our side so
-	// the receiver's inbound TCP connect can get through.
-	if s.Info.Relay != "" {
-		go s.holePunchWhenReady(ctx)
-	}
-
-	conn, err := s.listener.Accept()
-	if err != nil {
-		if ctx.Err() != nil {
-			return ctx.Err()
+	// Accept connections until one passes authentication.
+	// Internet NAT devices occasionally reset connections immediately after
+	// the TCP handshake; keep retrying until we get a valid auth code.
+	var conn net.Conn
+	for {
+		c, err := s.listener.Accept()
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fmt.Errorf("accept: %w", err)
 		}
-		return fmt.Errorf("waiting for receiver: %w", err)
+		tuneConn(c)
+
+		_ = c.SetDeadline(time.Now().Add(30 * time.Second))
+		var codeBuf [8]byte
+		if _, err := io.ReadFull(c, codeBuf[:]); err != nil {
+			slog.Info("p2p: pre-auth read failed, retrying", "err", err)
+			c.Close()
+			continue
+		}
+		_ = c.SetDeadline(time.Time{})
+
+		if string(codeBuf[:]) != s.Info.Code {
+			_ = writeLenFrame(c, []byte("ERR:bad_code"))
+			c.Close()
+			return fmt.Errorf("bad auth code received")
+		}
+		conn = c
+		break
 	}
 	defer conn.Close()
 
-	if tc, ok := conn.(*net.TCPConn); ok {
-		tc.SetWriteBuffer(8 * 1024 * 1024)
-		tc.SetNoDelay(true)
-		tc.SetKeepAlive(true)
-		tc.SetKeepAlivePeriod(30 * time.Second)
-	}
-
-	// ── Handshake ────────────────────────────────────────────────────────────
-	codeBuf := make([]byte, 8)
-	if _, err := io.ReadFull(conn, codeBuf); err != nil {
-		return fmt.Errorf("read auth code: %w", err)
-	}
-	if string(codeBuf) != s.Info.Code {
-		conn.Write([]byte("ERR:bad_code\n"))
-		return fmt.Errorf("receiver sent wrong code")
-	}
-
+	// Open source file.
 	f, stat, err := openFileInfo(s.filePath)
 	if err != nil {
-		conn.Write([]byte("ERR:file_error\n"))
+		_ = writeLenFrame(conn, []byte("ERR:file_error"))
 		return err
 	}
 	defer f.Close()
@@ -166,151 +282,91 @@ func (s *PeerServer) Serve(ctx context.Context, progress ProgressFn) error {
 		totalChunks = 1
 	}
 
-	type metaMsg struct {
-		FileName    string `json:"f"`
-		FileSize    int64  `json:"s"`
-		TotalChunks int    `json:"n"`
-		ChunkSize   int64  `json:"c"`
-	}
+	// Send metadata frame.
 	meta, _ := json.Marshal(metaMsg{stat.Name(), fileSize, totalChunks, chunkSize})
-	conn.Write(append(meta, '\n'))
+	if err := writeLenFrame(conn, meta); err != nil {
+		return fmt.Errorf("send metadata: %w", err)
+	}
 
-	// ── Encryption pipeline ──────────────────────────────────────────────────
-	// Producer encrypts next chunk while consumer transmits current one,
-	// overlapping CPU-bound encryption with network I/O.
-	pipeline := make(chan pipeChunk, 3)
+	slog.Info("p2p: sending", "file", stat.Name(), "size", fileSize, "chunks", totalChunks)
+
+	// Pipeline producer: reads file → encrypts → pushes to channel.
+	// Allows encryption of chunk N+1 to overlap with network I/O of chunk N.
+	type pipeItem struct {
+		enc   []byte
+		plain int64
+		err   error
+	}
+	pipeline := make(chan pipeItem, 2)
 	go func() {
 		defer close(pipeline)
-		for i := 0; i < totalChunks; i++ {
-			select {
-			case <-ctx.Done():
+		for ci := 0; ci < totalChunks; ci++ {
+			if ctx.Err() != nil {
+				pipeline <- pipeItem{err: ctx.Err()}
 				return
-			default:
 			}
-			offset := int64(i) * chunkSize
+			offset := int64(ci) * chunkSize
 			end := min(offset+chunkSize, fileSize)
-			plain := make([]byte, end-offset)
-
-			if _, err := f.ReadAt(plain, offset); err != nil && err != io.EOF {
-				pipeline <- pipeChunk{err: fmt.Errorf("read chunk %d: %w", i, err)}
+			buf := make([]byte, end-offset)
+			if _, err := f.ReadAt(buf, offset); err != nil && err != io.EOF {
+				pipeline <- pipeItem{err: fmt.Errorf("read chunk %d: %w", ci, err)}
 				return
 			}
-			enc, err := encryptChunk(s.key, i, plain)
+			enc, err := encryptChunk(s.key, ci, buf)
 			if err != nil {
-				pipeline <- pipeChunk{err: fmt.Errorf("encrypt chunk %d: %w", i, err)}
+				pipeline <- pipeItem{err: fmt.Errorf("encrypt chunk %d: %w", ci, err)}
 				return
 			}
-			pipeline <- pipeChunk{data: enc, plainLen: end - offset}
+			pipeline <- pipeItem{enc: enc, plain: end - offset}
 		}
 	}()
 
-	// ── Transmit ─────────────────────────────────────────────────────────────
+	var bytesDone, doneChunks atomic.Int64
 	startTime := time.Now()
-	var bytesDone int64
-	sizeBuf := make([]byte, 4)
+	w := bufio.NewWriterSize(conn, 256*1024)
+	var sizeBuf [4]byte
 
-	for i := 0; ; i++ {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
-		pc, ok := <-pipeline
+	for ci := 0; ; ci++ {
+		it, ok := <-pipeline
 		if !ok {
 			break
 		}
-		if pc.err != nil {
-			return pc.err
+		if it.err != nil {
+			return it.err
 		}
-
-		binary.BigEndian.PutUint32(sizeBuf, uint32(len(pc.data)))
-		if _, err := conn.Write(sizeBuf); err != nil {
-			return fmt.Errorf("send chunk %d size: %w", i, err)
+		binary.BigEndian.PutUint32(sizeBuf[:], uint32(len(it.enc)))
+		if _, err := w.Write(sizeBuf[:]); err != nil {
+			return fmt.Errorf("send chunk %d size: %w", ci, err)
 		}
-		if _, err := conn.Write(pc.data); err != nil {
-			return fmt.Errorf("send chunk %d data: %w", i, err)
+		if _, err := w.Write(it.enc); err != nil {
+			return fmt.Errorf("send chunk %d data: %w", ci, err)
 		}
-
-		bytesDone += pc.plainLen
+		bytesDone.Add(it.plain)
+		doneChunks.Add(1)
 		if progress != nil {
+			bd := bytesDone.Load()
 			elapsed := time.Since(startTime).Seconds()
 			var spd int64
 			if elapsed > 0 {
-				spd = int64(float64(bytesDone) / elapsed)
+				spd = int64(float64(bd) / elapsed)
 			}
 			progress(ProgressEvent{
-				Done: i + 1, Total: totalChunks,
-				BytesDone: bytesDone, TotalBytes: fileSize,
-				SpeedBPS: spd,
+				Done:       int(doneChunks.Load()),
+				Total:      totalChunks,
+				BytesDone:  bd,
+				TotalBytes: fileSize,
+				SpeedBPS:   spd,
 			})
 		}
 	}
-	return nil
+	return w.Flush()
 }
 
-// Close cancels the peer server (e.g., user cancelled waiting).
-func (s *PeerServer) Close() {
-	s.listener.Close()
-}
-
-// holePunchWhenReady waits for the receiver to appear in the rendezvous, then
-// fires UDP punch packets toward them so the sender's NAT entry is created.
-// The receiver's subsequent TCP connect then gets forwarded by our NAT.
-func (s *PeerServer) holePunchWhenReady(ctx context.Context) {
-	// Long-poll: relay blocks until receiver POST /p2p/meet/{code}.
-	resp, err := httpGetWithContext(ctx, s.Info.Relay+"/api/v1/p2p/wait/"+s.Info.Code, 6*time.Minute)
-	if err != nil {
-		return
-	}
-	defer resp.Body.Close()
-	var body struct {
-		ReceiverWAN string `json:"receiverWAN"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil || body.ReceiverWAN == "" {
-		return
-	}
-
-	port := s.listener.Addr().(*net.TCPAddr).Port
-	slog.Info("hole punching toward receiver", "receiverWAN", body.ReceiverWAN)
-	punchCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-	UDPPunch(punchCtx, port, body.ReceiverWAN, 12*time.Second) //nolint:errcheck
-}
-
-// ── HTTP helpers ──────────────────────────────────────────────────────────────
-
-func jsonMarshal(v any) []byte {
-	b, _ := json.Marshal(v)
-	return b
-}
-
-func post(url string, body []byte) {
-	resp, err := http.Post(url, "application/json", bytes.NewReader(body)) //nolint:gosec
-	if err == nil {
-		resp.Body.Close()
-	}
-}
-
-func httpGetWithContext(ctx context.Context, url string, timeout time.Duration) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, err
-	}
-	client := &http.Client{Timeout: timeout}
-	return client.Do(req)
-}
-
-// ── Receiver side ────────────────────────────────────────────────────────────
-
-// PeerReceive connects to a PeerServer and downloads the file.
-// Connection is attempted in priority order:
-//  1. Direct TCP to peerAddr (LAN or open-port WAN)
-//  2. UDP hole punch via relay rendezvous + TCP through punched NAT
-//  3. Relay streaming fallback (if relayURL != "")
+// PeerReceive connects to a PeerServer, authenticates, and downloads the file.
 //
-// Cancelling ctx aborts everything.
-func PeerReceive(ctx context.Context, peerAddr, code, keyB64, relayURL, outputDir string, progress ProgressFn) (string, error) {
+// Retries the connection up to 3 times (internet links can be flaky).
+// Decrypts each chunk immediately after receipt and writes to the output file.
+func PeerReceive(ctx context.Context, peerAddr, code, keyB64, outputDir string, progress ProgressFn) (string, error) {
 	key, err := base64.RawURLEncoding.DecodeString(keyB64)
 	if err != nil {
 		return "", fmt.Errorf("invalid key: %w", err)
@@ -319,186 +375,180 @@ func PeerReceive(ctx context.Context, peerAddr, code, keyB64, relayURL, outputDi
 		return "", fmt.Errorf("key must be 32 bytes, got %d", len(key))
 	}
 
-	sendCode := func(conn net.Conn) error {
-		_, err := fmt.Fprint(conn, code)
-		return err
-	}
+	const maxAttempts = 3
+	var conn net.Conn
+	var meta metaMsg
 
-	// ── Path 1: direct TCP (LAN or open port) ───────────────────────────────
-	conn, directErr := tryDirectConnect(ctx, peerAddr)
-	if directErr == nil {
-		slog.Info("p2p: direct connection", "addr", peerAddr)
-		if err := sendCode(conn); err != nil {
-			conn.Close()
-		} else {
-			return receiveViaConn(ctx, conn, key, outputDir, progress)
-		}
-	}
-	slog.Info("p2p: direct connect failed, trying hole punch", "err", directErr)
+	d := &net.Dialer{Timeout: 15 * time.Second}
 
-	// ── Path 2: UDP hole punch + TCP through punched NAT ────────────────────
-	if relayURL != "" && peerAddr != "" {
-		conn, punchErr := tryHolePunch(ctx, relayURL, peerAddr, code)
-		if punchErr == nil {
-			slog.Info("p2p: hole punch succeeded")
-			if err := sendCode(conn); err != nil {
-				conn.Close()
-			} else {
-				return receiveViaConn(ctx, conn, key, outputDir, progress)
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			delay := time.Duration(attempt) * 2 * time.Second
+			slog.Info("p2p: retrying connection", "attempt", attempt+1, "in", delay)
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				return "", ctx.Err()
 			}
 		}
-		slog.Info("p2p: hole punch failed, falling back to relay", "err", punchErr)
+
+		c, err := d.DialContext(ctx, "tcp", peerAddr)
+		if err != nil {
+			slog.Info("p2p: dial failed", "attempt", attempt+1, "err", err)
+			if attempt < maxAttempts-1 {
+				continue
+			}
+			return "", fmt.Errorf("connect to %s: %w", peerAddr, err)
+		}
+		tuneConn(c)
+
+		// Send auth code (must arrive within 30 s to avoid sender timeout).
+		_ = c.SetDeadline(time.Now().Add(30 * time.Second))
+		if _, err := c.Write([]byte(code)); err != nil {
+			c.Close()
+			slog.Info("p2p: send auth failed", "attempt", attempt+1, "err", err)
+			if attempt < maxAttempts-1 {
+				continue
+			}
+			return "", fmt.Errorf("send auth: %w", err)
+		}
+
+		// Read metadata frame (sender has 30 s to respond).
+		metaBytes, err := readLenFrame(c)
+		_ = c.SetDeadline(time.Time{})
+		if err != nil {
+			c.Close()
+			if ctx.Err() != nil {
+				return "", ctx.Err()
+			}
+			slog.Info("p2p: read metadata failed", "attempt", attempt+1, "err", err)
+			if attempt < maxAttempts-1 {
+				continue
+			}
+			return "", fmt.Errorf("read metadata: %w", err)
+		}
+
+		if strings.HasPrefix(string(metaBytes), "ERR:") {
+			c.Close()
+			return "", fmt.Errorf("sender error: %s", strings.TrimPrefix(string(metaBytes), "ERR:"))
+		}
+
+		if err := json.Unmarshal(metaBytes, &meta); err != nil {
+			c.Close()
+			slog.Info("p2p: bad metadata", "attempt", attempt+1, "err", err)
+			if attempt < maxAttempts-1 {
+				continue
+			}
+			return "", fmt.Errorf("parse metadata: %w", err)
+		}
+
+		conn = c
+		break
 	}
 
-	// ── Path 3: relay streaming fallback ────────────────────────────────────
-	if relayURL != "" {
-		slog.Info("p2p: using relay stream fallback")
-		return Receive(ctx, relayURL, code, keyB64, outputDir, 4, progress)
+	if conn == nil {
+		return "", fmt.Errorf("failed to connect after %d attempts", maxAttempts)
 	}
-
-	return "", fmt.Errorf("all connection paths failed: %w", directErr)
-}
-
-// tryDirectConnect attempts a plain TCP connection with a 5-second timeout.
-func tryDirectConnect(ctx context.Context, addr string) (net.Conn, error) {
-	d := &net.Dialer{Timeout: 5 * time.Second}
-	return d.DialContext(ctx, "tcp", addr)
-}
-
-// tryHolePunch performs UDP hole punching via the relay rendezvous, then
-// attempts a TCP connection to peerAddr through the now-open NAT mapping.
-func tryHolePunch(ctx context.Context, relayURL, peerWAN, code string) (net.Conn, error) {
-	// Discover our own WAN address via STUN (UDP).
-	ownWAN, _ := DiscoverWANAddr(0) // port 0 = ephemeral; just need the external IP
-
-	// Tell the relay we're here. The relay will notify the sender (via /wait),
-	// which will trigger the sender's UDP punch toward us.
-	meetBody := jsonMarshal(map[string]string{
-		"wan": ownWAN,
-		"lan": fmt.Sprintf("%s:0", GetLocalIP()),
-	})
-	meetResp, err := http.Post(relayURL+"/api/v1/p2p/meet/"+code, "application/json", bytes.NewReader(meetBody)) //nolint:gosec
-	if err != nil {
-		return nil, fmt.Errorf("rendezvous meet: %w", err)
-	}
-	meetResp.Body.Close()
-
-	// Punch simultaneously — sender is doing the same after /wait returns.
-	punchCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
-	defer cancel()
-	if err := UDPPunch(punchCtx, 0, peerWAN, 10*time.Second); err != nil {
-		slog.Info("p2p: udp punch no confirmation, trying TCP anyway", "err", err)
-		// Not fatal — cone NAT may have opened our side even without confirmation.
-	}
-
-	// Now attempt TCP to peerWAN — NAT entry created by punch should allow it.
-	tCtx, tCancel := context.WithTimeout(ctx, 8*time.Second)
-	defer tCancel()
-	d := &net.Dialer{Timeout: 8 * time.Second}
-	return d.DialContext(tCtx, "tcp", peerWAN)
-}
-
-// receiveViaConn performs the auth handshake and file download over an
-// already-established net.Conn (reused for both direct and hole-punch paths).
-func receiveViaConn(ctx context.Context, conn net.Conn, key []byte, outputDir string, progress ProgressFn) (string, error) {
 	defer conn.Close()
 
-	done := make(chan struct{})
-	defer close(done)
+	// Cancel connection when context is done.
+	connClosed := make(chan struct{})
+	defer close(connClosed)
 	go func() {
 		select {
 		case <-ctx.Done():
 			conn.Close()
-		case <-done:
+		case <-connClosed:
 		}
 	}()
 
-	if tc, ok := conn.(*net.TCPConn); ok {
-		tc.SetReadBuffer(8 * 1024 * 1024)
-		tc.SetNoDelay(true)
-		tc.SetKeepAlive(true)
-		tc.SetKeepAlivePeriod(30 * time.Second)
-	}
+	slog.Info("p2p: receiving", "file", meta.FileName, "size", meta.FileSize, "chunks", meta.TotalChunks)
 
-	reader := bufio.NewReaderSize(conn, 4*1024*1024)
-	line, err := reader.ReadString('\n')
-	if err != nil {
-		if ctx.Err() != nil {
-			return "", ctx.Err()
-		}
-		return "", fmt.Errorf("read metadata: %w", err)
-	}
-	if strings.HasPrefix(line, "ERR:") {
-		return "", fmt.Errorf("sender error: %s", strings.TrimSpace(line[4:]))
-	}
-
-	type metaMsg struct {
-		FileName    string `json:"f"`
-		FileSize    int64  `json:"s"`
-		TotalChunks int    `json:"n"`
-		ChunkSize   int64  `json:"c"`
-	}
-	var meta metaMsg
-	if err := json.Unmarshal([]byte(strings.TrimSpace(line)), &meta); err != nil {
-		return "", fmt.Errorf("parse metadata: %w", err)
-	}
-
+	// Create output file and pre-allocate size.
 	outPath := filepath.Join(outputDir, filepath.Base(meta.FileName))
 	outFile, err := os.Create(outPath)
 	if err != nil {
-		return "", fmt.Errorf("create output file: %w", err)
+		return "", fmt.Errorf("create output: %w", err)
 	}
 	defer outFile.Close()
 	_ = outFile.Truncate(meta.FileSize)
 
+	var bytesDone, doneChunks atomic.Int64
 	startTime := time.Now()
-	var bytesDone int64
-	sizeBuf := make([]byte, 4)
+	r := bufio.NewReaderSize(conn, 256*1024)
+	var sizeBuf [4]byte
 
-	for i := 0; i < meta.TotalChunks; i++ {
-		if _, err := io.ReadFull(reader, sizeBuf); err != nil {
-			os.Remove(outPath)
-			if ctx.Err() != nil {
-				return "", ctx.Err()
-			}
-			return "", fmt.Errorf("read chunk %d size: %w", i, err)
-		}
-		chunkLen := binary.BigEndian.Uint32(sizeBuf)
-
-		encData := make([]byte, chunkLen)
-		if _, err := io.ReadFull(reader, encData); err != nil {
-			os.Remove(outPath)
-			if ctx.Err() != nil {
-				return "", ctx.Err()
-			}
-			return "", fmt.Errorf("read chunk %d data: %w", i, err)
+	for ci := 0; ci < meta.TotalChunks; ci++ {
+		if ctx.Err() != nil {
+			outFile.Close()
+			_ = os.Remove(outPath)
+			return "", ctx.Err()
 		}
 
-		plain, err := decryptChunk(key, i, encData)
+		if _, err := io.ReadFull(r, sizeBuf[:]); err != nil {
+			outFile.Close()
+			_ = os.Remove(outPath)
+			return "", fmt.Errorf("read chunk %d size: %w", ci, err)
+		}
+		encLen := int(binary.BigEndian.Uint32(sizeBuf[:]))
+		if encLen == 0 || encLen > maxFrameLen {
+			outFile.Close()
+			_ = os.Remove(outPath)
+			return "", fmt.Errorf("chunk %d: invalid size %d", ci, encLen)
+		}
+
+		encData := make([]byte, encLen)
+		if _, err := io.ReadFull(r, encData); err != nil {
+			outFile.Close()
+			_ = os.Remove(outPath)
+			return "", fmt.Errorf("read chunk %d data: %w", ci, err)
+		}
+
+		plain, err := decryptChunk(key, ci, encData)
 		if err != nil {
-			os.Remove(outPath)
-			return "", fmt.Errorf("chunk %d: %w", i, err)
+			outFile.Close()
+			_ = os.Remove(outPath)
+			return "", fmt.Errorf("decrypt chunk %d: %w", ci, err)
 		}
 
-		offset := int64(i) * meta.ChunkSize
+		offset := int64(ci) * meta.ChunkSize
 		if _, err := outFile.WriteAt(plain, offset); err != nil {
-			os.Remove(outPath)
-			return "", fmt.Errorf("write chunk %d: %w", i, err)
+			outFile.Close()
+			_ = os.Remove(outPath)
+			return "", fmt.Errorf("write chunk %d: %w", ci, err)
 		}
 
-		bytesDone += int64(len(plain))
+		bytesDone.Add(int64(len(plain)))
+		doneChunks.Add(1)
 		if progress != nil {
+			bd := bytesDone.Load()
 			elapsed := time.Since(startTime).Seconds()
 			var spd int64
 			if elapsed > 0 {
-				spd = int64(float64(bytesDone) / elapsed)
+				spd = int64(float64(bd) / elapsed)
 			}
 			progress(ProgressEvent{
-				Done: i + 1, Total: meta.TotalChunks,
-				BytesDone: bytesDone, TotalBytes: meta.FileSize,
-				SpeedBPS: spd,
+				Done:       int(doneChunks.Load()),
+				Total:      meta.TotalChunks,
+				BytesDone:  bd,
+				TotalBytes: meta.FileSize,
+				SpeedBPS:   spd,
 			})
 		}
 	}
+
 	return outPath, nil
+}
+
+// tuneConn applies performance TCP socket options.
+func tuneConn(conn net.Conn) {
+	tc, ok := conn.(*net.TCPConn)
+	if !ok {
+		return
+	}
+	_ = tc.SetNoDelay(true)
+	_ = tc.SetKeepAlive(true)
+	_ = tc.SetKeepAlivePeriod(30 * time.Second)
+	_ = tc.SetReadBuffer(tcpBufSize)
+	_ = tc.SetWriteBuffer(tcpBufSize)
 }
